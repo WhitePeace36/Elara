@@ -1,5 +1,5 @@
 [Unit]
-Description=lunar adaptive Linux scheduler (sched_ext)
+Description=elara adaptive Linux scheduler (sched_ext)
 After=multi-user.target
 ConditionPathExists=/sys/kernel/sched_ext
 StartLimitIntervalSec=60
@@ -7,7 +7,7 @@ StartLimitBurst=3
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/lunar
+ExecStart=/usr/local/bin/elara
 Restart=on-failure
 
 [Install]

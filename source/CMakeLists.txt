@@ -1,5 +1,5 @@
 set(BPF_SRC
-    ${CMAKE_CURRENT_SOURCE_DIR}/lunar.bpf.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/elara.bpf.c
 )
 set(BPF_HEADER
     ${CMAKE_CURRENT_SOURCE_DIR}/defines.h
@@ -9,10 +9,10 @@ set(BPF_HEADER
 )
 
 set(BPF_OBJ
-    ${CMAKE_CURRENT_BINARY_DIR}/lunar.bpf.o
+    ${CMAKE_CURRENT_BINARY_DIR}/elara.bpf.o
 )
 set(BPF_SKEL
-    ${CMAKE_CURRENT_BINARY_DIR}/lunar.skel.h
+    ${CMAKE_CURRENT_BINARY_DIR}/elara.skel.h
 )
 
 add_custom_command(
@@ -30,16 +30,16 @@ add_custom_command(
     VERBATIM
 )
 
-set(lunarSource
+set(elaraSource
     main.cpp
 )
 
-set(lunarHeader
+set(elaraHeader
     datatypes.h
     defines.h
     dispatches.h
     helpers.h
-    lunar_topology.h
+    elara_topology.h
 )
 add_custom_command(
     OUTPUT ${BPF_SKEL}
@@ -49,19 +49,19 @@ add_custom_command(
     VERBATIM
 )
 
-add_custom_target(lunar_bpf DEPENDS ${BPF_OBJ} ${BPF_SKEL})
+add_custom_target(elara_bpf DEPENDS ${BPF_OBJ} ${BPF_SKEL})
 
-set_target_properties(lunar_bpf PROPERTIES
+set_target_properties(elara_bpf PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 
-add_executable(lunar
-    ${lunarSource}
-    ${lunarHeader}
+add_executable(elara
+    ${elaraSource}
+    ${elaraHeader}
 )
 
-add_dependencies(lunar lunar_bpf)
+add_dependencies(elara elara_bpf)
 
-target_include_directories(lunar PRIVATE
+target_include_directories(elara PRIVATE
     ${CMAKE_BINARY_DIR}
     ${CMAKE_SOURCE_DIR}
     ${LIBBPF_INCLUDE_DIRS}
@@ -69,21 +69,21 @@ target_include_directories(lunar PRIVATE
     ${CMAKE_SOURCE_DIR}/include/scx
 )
 
-target_link_libraries(lunar PRIVATE ${LIBBPF_LIBRARIES})
+target_link_libraries(elara PRIVATE ${LIBBPF_LIBRARIES})
 
-target_compile_options(lunar PRIVATE
+target_compile_options(elara PRIVATE
     -Wall -Wextra -Wpedantic -Wno-overlength-strings -fno-strict-aliasing -fwrapv -O3 -flto=thin -march=native -Wno-unused-parameter -Wno-missing-declarations
 )
 
-target_link_options(lunar PRIVATE
+target_link_options(elara PRIVATE
     -flto=thin -fuse-ld=lld -march=native
 )
 
-set_target_properties(lunar PROPERTIES
+set_target_properties(elara PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 
 
-source_group(SourceFiles FILES ${lunarSource})
-source_group(HeaderFiles FILES ${lunarHeader})
+source_group(SourceFiles FILES ${elaraSource})
+source_group(HeaderFiles FILES ${elaraHeader})
 
-install(TARGETS lunar RUNTIME DESTINATION bin)
+install(TARGETS elara RUNTIME DESTINATION bin)

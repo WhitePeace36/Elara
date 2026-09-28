@@ -11,7 +11,7 @@
 #include <string>
 #include <vector>
 
-namespace lunar
+namespace elara
 {
 namespace fs = std::filesystem;
 
@@ -152,7 +152,7 @@ inline std::optional<Topology> read_topology(const fs::path& cpu_root = "/sys/de
   const auto online = read_cpulist_file(cpu_root / "online");
   if (!online || online->empty())
   {
-    std::cerr << "lunar: failed to read online CPUs from " << cpu_root << "/online\n";
+    std::cerr << "elara: failed to read online CPUs from " << cpu_root << "/online\n";
     return std::nullopt;
   }
 
@@ -199,12 +199,12 @@ inline std::optional<Topology> read_topology(const fs::path& cpu_root = "/sys/de
   return topo;
 }
 
-}  // namespace lunar
+}  // namespace elara
 
 template <typename Skel>
-bool setup_lunar_topology(Skel* skel, const std::filesystem::path& cpu_root = "/sys/devices/system/cpu")
+bool setup_elara_topology(Skel* skel, const std::filesystem::path& cpu_root = "/sys/devices/system/cpu")
 {
-  const auto topo = lunar::read_topology(cpu_root);
+  const auto topo = elara::read_topology(cpu_root);
   if (!topo)
   {
     return false;
@@ -213,12 +213,12 @@ bool setup_lunar_topology(Skel* skel, const std::filesystem::path& cpu_root = "/
   const auto max_cpus = static_cast<std::uint32_t>(std::size(skel->rodata->cpu_to_llc));
   if (topo->nr_cpu_ids > max_cpus)
   {
-    std::cerr << "lunar: system has " << topo->nr_cpu_ids << " possible CPU ids, but MAX_CPUS is " << max_cpus << "; bump it in defines.h\n";
+    std::cerr << "elara: system has " << topo->nr_cpu_ids << " possible CPU ids, but MAX_CPUS is " << max_cpus << "; bump it in defines.h\n";
     return false;
   }
   if (topo->nr_llcs == 0)
   {
-    std::cerr << "lunar: topology reported zero LLC domains\n";
+    std::cerr << "elara: topology reported zero LLC domains\n";
     return false;
   }
 
@@ -239,7 +239,7 @@ bool setup_lunar_topology(Skel* skel, const std::filesystem::path& cpu_root = "/
       ++nr_online;
   }
 
-  std::cerr << "lunar: topology: " << topo->nr_cpu_ids << " cpu ids (" << nr_online << " online), " << topo->nr_llcs << " llc domain(s)\n";
+  std::cerr << "elara: topology: " << topo->nr_cpu_ids << " cpu ids (" << nr_online << " online), " << topo->nr_llcs << " llc domain(s)\n";
   for (std::uint32_t cpu = 0; cpu < topo->nr_cpu_ids; ++cpu)
   {
     if (topo->cpu_online[cpu])

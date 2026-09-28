@@ -30,9 +30,9 @@ run_step() {
     fi
 }
 
-run_step "Disable and stop lunar.service"   --optional sudo systemctl disable --now lunar.service
-run_step "Remove service unit"              --optional sudo rm /etc/systemd/system/lunar.service
-run_step "Remove binary from /usr/local/bin" --optional sudo rm /usr/local/bin/lunar
+run_step "Disable and stop elara.service"   --optional sudo systemctl disable --now elara.service
+run_step "Remove service unit"              --optional sudo rm /etc/systemd/system/elara.service
+run_step "Remove binary from /usr/local/bin" --optional sudo rm /usr/local/bin/elara
 run_step "Reload systemd units"             --optional sudo systemctl daemon-reload
 
 echo "${GREEN}Teardown complete.${RESET}"

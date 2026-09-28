@@ -19,7 +19,7 @@ UEI_DEFINE(uei);
 
 // callbacks
 
-s32 BPF_STRUCT_OPS_SLEEPABLE(lunar_init)
+s32 BPF_STRUCT_OPS_SLEEPABLE(elara_init)
 {
   s32 ret;
 
@@ -72,7 +72,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lunar_init)
   return 0;
 }
 
-s32 BPF_STRUCT_OPS_SLEEPABLE(lunar_init_task, struct task_struct* p, struct scx_init_task_args* args)
+s32 BPF_STRUCT_OPS_SLEEPABLE(elara_init_task, struct task_struct* p, struct scx_init_task_args* args)
 {
   struct task_ctx* tctx;
   u64 now = bpf_ktime_get_ns();
@@ -93,9 +93,9 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lunar_init_task, struct task_struct* p, struct scx_
   return 0;
 }
 
-void BPF_STRUCT_OPS(lunar_exit_task, struct task_struct* p, struct scx_exit_task_args* args) { }
+void BPF_STRUCT_OPS(elara_exit_task, struct task_struct* p, struct scx_exit_task_args* args) { }
 
-s32 BPF_STRUCT_OPS(lunar_select_cpu, struct task_struct* p, s32 prev_cpu, u64 wake_flags)
+s32 BPF_STRUCT_OPS(elara_select_cpu, struct task_struct* p, s32 prev_cpu, u64 wake_flags)
 {
   bool is_idle = false;
   s32 cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
@@ -114,7 +114,7 @@ s32 BPF_STRUCT_OPS(lunar_select_cpu, struct task_struct* p, s32 prev_cpu, u64 wa
   return cpu;
 }
 
-void BPF_STRUCT_OPS(lunar_enqueue, struct task_struct* p, u64 enq_flags)
+void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
 {
   struct task_ctx* tctx = get_task_ctx(p);
   u64 band = task_band(p);
@@ -191,7 +191,7 @@ void BPF_STRUCT_OPS(lunar_enqueue, struct task_struct* p, u64 enq_flags)
   }
 }
 
-void BPF_STRUCT_OPS(lunar_dispatch, s32 cpu, struct task_struct* prev)
+void BPF_STRUCT_OPS(elara_dispatch, s32 cpu, struct task_struct* prev)
 {
   u64 prev_band = BAND_AMOUNT;
   u64 prev_key = (u64)-1;
@@ -227,7 +227,7 @@ void BPF_STRUCT_OPS(lunar_dispatch, s32 cpu, struct task_struct* prev)
   dctx->preempt_pending = false;
 }
 
-void BPF_STRUCT_OPS(lunar_running, struct task_struct* p)
+void BPF_STRUCT_OPS(elara_running, struct task_struct* p)
 {
   struct task_ctx* context = get_task_ctx(p);
   if (!context)
@@ -261,7 +261,7 @@ void BPF_STRUCT_OPS(lunar_running, struct task_struct* p)
   kick_idle_for_waiting(cpu);
 }
 
-void BPF_STRUCT_OPS(lunar_stopping, struct task_struct* task, bool runnable)
+void BPF_STRUCT_OPS(elara_stopping, struct task_struct* task, bool runnable)
 {
   u64 now = bpf_ktime_get_ns();
 
@@ -285,12 +285,12 @@ void BPF_STRUCT_OPS(lunar_stopping, struct task_struct* task, bool runnable)
   dctx->running_band = BAND_AMOUNT;
 }
 
-void BPF_STRUCT_OPS(lunar_exit, struct scx_exit_info* ei)
+void BPF_STRUCT_OPS(elara_exit, struct scx_exit_info* ei)
 {
   UEI_RECORD(uei, ei);
 }
 
-void BPF_STRUCT_OPS(lunar_quiescent, struct task_struct* p, u64 deq_flags)
+void BPF_STRUCT_OPS(elara_quiescent, struct task_struct* p, u64 deq_flags)
 {
   struct task_ctx* tctx = get_task_ctx(p);
   if (!tctx)
@@ -299,15 +299,15 @@ void BPF_STRUCT_OPS(lunar_quiescent, struct task_struct* p, u64 deq_flags)
   tctx->resume_slice = 0;
 }
 
-SCX_OPS_DEFINE(lunar_ops,
-               .init = (void*)lunar_init,
-               .init_task = (void*)lunar_init_task,
-               .exit_task = (void*)lunar_exit_task,
-               .select_cpu = (void*)lunar_select_cpu,
-               .quiescent = (void*)lunar_quiescent,
-               .running = (void*)lunar_running,
-               .enqueue = (void*)lunar_enqueue,
-               .dispatch = (void*)lunar_dispatch,
-               .stopping = (void*)lunar_stopping,
-               .exit = (void*)lunar_exit,
-               .name = "scx_lunar");
+SCX_OPS_DEFINE(elara_ops,
+               .init = (void*)elara_init,
+               .init_task = (void*)elara_init_task,
+               .exit_task = (void*)elara_exit_task,
+               .select_cpu = (void*)elara_select_cpu,
+               .quiescent = (void*)elara_quiescent,
+               .running = (void*)elara_running,
+               .enqueue = (void*)elara_enqueue,
+               .dispatch = (void*)elara_dispatch,
+               .stopping = (void*)elara_stopping,
+               .exit = (void*)elara_exit,
+               .name = "scx_elara");

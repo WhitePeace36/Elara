@@ -17,7 +17,7 @@ typedef int16_t s16;
 typedef uint8_t u8;
 typedef int8_t s8;
 
-#include "lunar_topology.h"
+#include "elara_topology.h"
 
 using namespace std;
 
@@ -25,7 +25,7 @@ using namespace std;
 #include <include/scx/enums.h>
 #include <include/scx/user_exit_info_common.h>
 #include <include/scx/enums.autogen.h>
-#include <source/lunar.skel.h>
+#include <source/elara.skel.h>
 
 std::atomic<bool> stop{};
 
@@ -43,7 +43,7 @@ enum class RunResult
 
 static RunResult run_once()
 {
-  lunar_bpf* skel = lunar_bpf__open();
+  elara_bpf* skel = elara_bpf__open();
   if (!skel)
   {
     std::cerr << "Failed to create BPF skeleton." << std::endl;
@@ -51,38 +51,38 @@ static RunResult run_once()
   }
   SCX_ENUM_INIT(skel);
 
-  skel->struct_ops.lunar_ops->hotplug_seq = scx_hotplug_seq();
+  skel->struct_ops.elara_ops->hotplug_seq = scx_hotplug_seq();
 
-  UEI_SET_SIZE(skel, lunar_ops, uei);
+  UEI_SET_SIZE(skel, elara_ops, uei);
 
-  if (!setup_lunar_topology(skel))
+  if (!setup_elara_topology(skel))
   {
     std::cerr << "Failed to load llc information." << std::endl;
-    lunar_bpf__destroy(skel);
+    elara_bpf__destroy(skel);
     return RunResult::Failed;
   }
 
-  int err = lunar_bpf__load(skel);
+  int err = elara_bpf__load(skel);
   if (err)
   {
     std::cerr << "Failed to load scheduler: " << err << std::endl;
-    lunar_bpf__destroy(skel);
+    elara_bpf__destroy(skel);
     return RunResult::Failed;
   }
 
-  std::cerr << "Successfully opened and loaded the lunar scheduler." << std::endl;
+  std::cerr << "Successfully opened and loaded the elara scheduler." << std::endl;
 
   std::cout << "Attaching sched_ext scheduler..." << std::endl;
 
-  err = lunar_bpf__attach(skel);
+  err = elara_bpf__attach(skel);
   if (err)
   {
     std::cerr << "Failed to attach BPF programs: " << err << std::endl;
-    lunar_bpf__destroy(skel);
+    elara_bpf__destroy(skel);
     return RunResult::Failed;
   }
 
-  std::cout << "lunar scheduler is successfully running!" << std::endl;
+  std::cout << "elara scheduler is successfully running!" << std::endl;
 
   bool ejected = false;
   while (!stop)
@@ -102,7 +102,7 @@ static RunResult run_once()
     result = UEI_ECODE_RESTART(ecode) ? RunResult::Restart : RunResult::Failed;
   }
 
-  lunar_bpf__destroy(skel);
+  elara_bpf__destroy(skel);
   return result;
 }
 

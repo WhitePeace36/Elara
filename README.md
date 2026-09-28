@@ -1,9 +1,9 @@
 
-# Lunar
+# Elara
 
 ## Introduction
 
-Scx_lunar is a multipurpose scheduler which was originally invented with the goal to make frametimes in games as smooth as possible
+Scx_elara is a multipurpose scheduler which was originally invented with the goal to make frametimes in games as smooth as possible
 
 Every cpu has 5 queues, one per band. The band is chosen by the nice value of a task,
 inside a band the tasks are ordered by vtime, so every task of a band gets its fair share.
@@ -25,7 +25,7 @@ But this kernel option should be enabled by default, but not bad to check never 
 The nice value decides the band of a task (see below). It does not change the slice or
 the share of cpu time, it only decides which band is served first.
 
-So nice values are the way to tell lunar what is important. Tools like ananicy-cpp can
+So nice values are the way to tell elara what is important. Tools like ananicy-cpp can
 be used for that, for example to put audio into band 0, a game into band 1 and
 background work into band 3 or 4.
 
@@ -142,7 +142,7 @@ nothing starves. The values are in `source/defines.h`.
 ## CPU hotplug
 
 When cpus go online or offline (for example when toggling SMT) the kernel stops
-the scheduler, and lunar restarts itself with the new topology.
+the scheduler, and elara restarts itself with the new topology.
 
 ## Testing
 
