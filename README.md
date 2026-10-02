@@ -3,10 +3,10 @@
 
 ## Introduction
 
-Scx_elara is a multipurpose scheduler which was originally invented with the goal to make frametimes in games as smooth as possible
+Scx_elara is a multipurpose scheduler which was inspired partly by the windows prio system and was developed with ananicy in mind.
 
-Every cpu has 5 queues, one per band. The band is chosen by the nice value of a task,
-inside a band the tasks are ordered by vtime, so every task of a band gets its fair share.
+But you will have to adjust the default ananicy profiles because they are set with nice being cpu time and not with it being prio.
+So preconfigured stuff will not fit great with this scheduler.
 
 ## Dependencies
 
@@ -64,6 +64,14 @@ Every cpu has one queue per band. The band is chosen by the nice value:
 | 2 | -2 to 2 |
 | 3 | 3 to 10 |
 | 4 | 11 to 20 |
+
+
+| Band | Example of tasks to put here |
+|---|---|
+| 0 | xwayland, kwin, pipewire, ... |
+| 1 | game or other programm which you mainly intend to use when open |
+| 2 | most default applications  |
+| 3, 4 | compiling or other stuff which you want to run in the background but you don't want to interrupt your work |
 
 Bands are served strictly in order. Most tasks run with nice 0, so they are in band 2.
 Band 0 holds high priority kernel threads (kworker/*H, ...) and everything that is
