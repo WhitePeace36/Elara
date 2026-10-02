@@ -25,11 +25,51 @@ static __always_inline bool is_percpu_kthread(const struct task_struct* p)
   return (p->flags & PF_KTHREAD) && p->nr_cpus_allowed == 1;
 }
 
-static __always_inline u64 task_band(const struct task_struct* p)
+static __always_inline bool comm_starts_with(const struct task_struct* p, const char* prefix, int len)
 {
-  if (is_percpu_kthread(p))
-    return BAND_0;
+  for (int i = 0; i < len; i++)
+  {
+    if (p->comm[i] != prefix[i])
+      return false;
+  }
+  return true;
+}
 
+// Kernel threads that barely use cpu, but others wait for them directly, so
+// they always go into band 0:
+// - kswapd/kcompactd (one per NUMA node): when they fall behind, every task
+//   that allocates memory has to reclaim or compact by itself, which stalls it
+//   much longer than the thread would.
+// - kthreadd: starts every kernel thread, also new kworkers a workqueue needs.
+// - rcu_exp_*: expedited RCU grace periods, synchronize_rcu_expedited() blocks
+//   until they are done.
+// - oom_reaper: frees the memory of an OOM killed task.
+// The length includes the terminating 0 where the whole name has to match.
+static __always_inline bool is_urgent_kthread(const struct task_struct* p)
+{
+  if (!(p->flags & PF_KTHREAD))
+    return false;
+  return comm_starts_with(p, "kswapd", 6) || comm_starts_with(p, "kcompactd", 9) || comm_starts_with(p, "kthreadd", 9) ||
+         comm_starts_with(p, "rcu_exp_", 8) || comm_starts_with(p, "oom_reaper", 11);
+}
+
+// Kernel threads doing work that tasks wait for, but which can also be heavy,
+// so they go into band 1 at least and share it fairly with the tasks there:
+// - unbound kworkers (kworker/u*): gpu job submission (amdgpu gfx_*), I/O
+//   completion (btrfs-endio), events_unbound, ... Per-cpu kworkers are already
+//   in band 0.
+// - jbd2 (ext4 journal) and btrfs-transaction: fsync waits for them.
+static __always_inline bool is_service_kthread(const struct task_struct* p)
+{
+  if (!(p->flags & PF_KTHREAD))
+    return false;
+  if (p->flags & PF_WQ_WORKER)
+    return true;
+  return comm_starts_with(p, "jbd2/", 5) || comm_starts_with(p, "btrfs-transacti", 15);
+}
+
+static __always_inline u64 nice_band(const struct task_struct* p)
+{
   int nice = p->static_prio - NICE_0_PRIO;
 
   if (nice <= BAND_0_MAX_NICE)
@@ -41,6 +81,17 @@ static __always_inline u64 task_band(const struct task_struct* p)
   if (nice <= BAND_3_MAX_NICE)
     return BAND_3;
   return BAND_4;
+}
+
+static __always_inline u64 task_band(const struct task_struct* p)
+{
+  if (is_percpu_kthread(p) || is_urgent_kthread(p))
+    return BAND_0;
+
+  u64 band = nice_band(p);
+  if (band > BAND_1 && is_service_kthread(p))
+    return BAND_1;
+  return band;
 }
 
 static __always_inline u64 dsq_queued(u64 dsq)

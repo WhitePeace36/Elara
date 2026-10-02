@@ -74,6 +74,22 @@ go into band 0, whatever their nice value. Only they can do the work of their cp
 they should never wait behind anything. Unbound kernel threads (kworker/u*) and user
 tasks pinned to one cpu are handled by their nice value like everything else.
 
+Some other kernel threads barely use cpu, but other tasks wait for them directly. They
+also always go into band 0:
+
+- kswapd0, kcompactd0 (one per NUMA node): when they fall behind, every task that needs
+  memory has to reclaim or compact by itself, and that stalls it much longer
+- kthreadd: starts every kernel thread, also new kworkers a workqueue needs
+- rcu_exp_*: expedited RCU grace periods, whoever waits for one blocks until it is done
+- oom_reaper: frees the memory of an OOM killed task
+
+Kernel threads doing work that tasks wait for, but that can also be heavy, go into
+band 1 at least, where they share the cpu fairly with the tasks there:
+
+- unbound kworkers (kworker/u*): gpu job submission (amdgpu gfx_*), I/O completion
+  (btrfs-endio), events_unbound, ...
+- jbd2 (ext4 journal) and btrfs-transaction: fsync waits for them
+
 Every task has a slice of 1ms. Nice values don't change the slice.
 
 ### vtime inside a band
