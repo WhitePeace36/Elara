@@ -123,6 +123,9 @@ cpu.
 
 ## Preemption
 
+This is the old state !
+Preemption inside the same band is disabled at the moment!
+
 A waking task of a higher band preempts a running task of a lower band. Inside the same
 band a waking task preempts when its key is more than 0.25ms earlier than the current
 vtime of the running task, so when it used clearly less cpu. Tasks with similar usage
