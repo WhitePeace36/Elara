@@ -107,14 +107,12 @@ cpu.
 
 ## Preemption
 
-This is the old state !
-Preemption inside the same band is disabled at the moment!
+A waking task of a higher band preempts a running task of a lower band. The preempted
+task goes back into its queue with its vtime and the rest of its slice.
 
-A waking task of a higher band preempts a running task of a lower band. Inside the same
-band a waking task preempts when its key is more than 0.25ms earlier than the current
-vtime of the running task, so when it used clearly less cpu. Tasks with similar usage
-don't preempt each other. The preempted task goes back into its queue with its vtime and
-the rest of its slice.
+Inside the same band there is no preemption. A waking task waits until the slice of the
+running task ends (at most 1ms) and is then served by its vtime key, so a task that used
+little cpu still goes first.
 
 When the slice of a task runs out, its vtime is updated. It keeps running for another
 slice if its band is better than every queued band on its cpu, or if in the same band

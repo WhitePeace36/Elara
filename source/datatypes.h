@@ -30,10 +30,8 @@ struct task_ctx
 
 struct dispatch_ctx
 {
-  // band and key of the task running on this cpu (BAND_AMOUNT: none)
+  // band of the task running on this cpu (BAND_AMOUNT: none)
   u64 running_band;
-  u64 running_key;
-  u64 running_since;
   // vtime reference per band: the highest key started on this cpu
   u64 band_vtime[BAND_AMOUNT];
   u64 band_head_ts[BAND_AMOUNT];

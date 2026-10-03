@@ -53,7 +53,6 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(elara_init)
 
     u64 now = bpf_ktime_get_ns();
     dispatch_ctx->running_band = BAND_AMOUNT;
-    dispatch_ctx->running_key = VTIME_BASE;
 
     u32 band;
     bpf_for(band, 0, BAND_AMOUNT)
@@ -164,31 +163,19 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
     return;
   }
 
-  // No preemption: still kick the cpu if it is idle or about to go idle.
-  // Without that a task inserted while the target is between stopping and
-  // dispatch could be missed and wait until something else wakes that cpu.
-  if (!(enq_flags & SCX_ENQ_WAKEUP) || band > running_band)
-  {
-    scx_bpf_kick_cpu(target, SCX_KICK_IDLE);
-    return;
-  }
-
-  bool preempt = band < running_band;
-  if (!preempt)
-  {
-    u64 running_vtime = dctx->running_key + elapsed(now, dctx->running_since);
-    preempt = (s64)(running_vtime - key) > (s64)SAME_BAND_PREEMPT_GRAN_NS;
-  }
-
-  if (preempt)
+  // Only a waking task of a higher band preempts. Inside a band the task waits
+  // for the end of the running slice and then goes by its vtime key.
+  if ((enq_flags & SCX_ENQ_WAKEUP) && band < running_band)
   {
     dctx->preempt_pending = true;
     scx_bpf_kick_cpu(target, SCX_KICK_PREEMPT);
+    return;
   }
-  else
-  {
-    scx_bpf_kick_cpu(target, SCX_KICK_IDLE);
-  }
+
+  // No preemption: still kick the cpu if it is idle or about to go idle.
+  // Without that a task inserted while the target is between stopping and
+  // dispatch could be missed and wait until something else wakes that cpu.
+  scx_bpf_kick_cpu(target, SCX_KICK_IDLE);
 }
 
 void BPF_STRUCT_OPS(elara_dispatch, s32 cpu, struct task_struct* prev)
@@ -222,8 +209,6 @@ void BPF_STRUCT_OPS(elara_dispatch, s32 cpu, struct task_struct* prev)
   pctx->granted_slice = SLICE_NS;
   advance_band_reference(dctx, prev_band, prev_key);
   dctx->running_band = prev_band;
-  dctx->running_key = prev_key;
-  dctx->running_since = now;
   dctx->preempt_pending = false;
 }
 
@@ -250,11 +235,9 @@ void BPF_STRUCT_OPS(elara_running, struct task_struct* p)
 
   advance_band_reference(dispatch_ctx, band, context->key);
   dispatch_ctx->running_band = band;
-  dispatch_ctx->running_key = context->key;
   dispatch_ctx->preempt_pending = false;
 
   context->started_at = bpf_ktime_get_ns();
-  dispatch_ctx->running_since = context->started_at;
   context->granted_slice = p->scx.slice;
   context->resume_slice = 0;
 
