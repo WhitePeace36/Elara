@@ -20,10 +20,6 @@ static __always_inline u64 cpu_load_ahead(u32 cpu, u64 band)
   if (dctx && dctx->running_band <= band)
     load++;
 
-  // Tasks already moved to the local DSQ run next. At a slice end this is the
-  // task that replaces prev while prev is being queued again, so without it
-  // the own cpu looks one task lighter than it is and an imbalance never
-  // gets corrected.
   load += dsq_queued(SCX_DSQ_LOCAL_ON | cpu);
 
   load += dsq_queued(band_dsq(BAND_0, cpu));
@@ -127,7 +123,6 @@ static __always_inline bool try_acquire_task_from_other_cpu(u64 band, u32 cpu, b
 
     if (dsq_queued(dsq) && scx_bpf_dsq_move_to_local(dsq, 0))
     {
-      // The victim's band head was just served: reset its starvation clock.
       struct dispatch_ctx* victim = get_dispatch_ctx(other);
       if (victim)
         stamp_band_head_ts(victim, band, now);
@@ -256,9 +251,6 @@ static __always_inline bool dispatch_dsq_per_cpu(u32 cpu, u64 prev_band, u64 pre
   u64 now = bpf_ktime_get_ns();
   int ret;
 
-  // A starved band goes first, before prev and before queued band 0 tasks,
-  // otherwise two band 0 tasks taking turns would never let the lower bands
-  // get their minimum.
   if (dctx)
   {
     u64 starved = most_starved_band(dctx, cpu, now);
@@ -269,7 +261,6 @@ static __always_inline bool dispatch_dsq_per_cpu(u32 cpu, u64 prev_band, u64 pre
     }
   }
 
-  // A queued band 0 task next, unless prev is band 0 with an earlier key.
   if (!(prev_band == BAND_0 && (s64)(prev_key - dsq_head_key(band_dsq(BAND_0, cpu))) <= 0) && take_from_local_band(dctx, BAND_0, cpu, now))
     return false;
 

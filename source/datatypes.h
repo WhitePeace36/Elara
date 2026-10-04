@@ -11,16 +11,14 @@
 
 const volatile u32 nr_llcs = 1;
 const volatile u32 cpu_to_llc[MAX_CPUS] = {};
-// Set by userspace from the topology. Offline cpus have queues too, but nobody
-// serves them, so no task may ever be placed there.
 const volatile u8 cpu_online[MAX_CPUS] = {};
 
 struct task_ctx
 {
-  // vtime of the task on the band timeline of @key_cpu: the key it was queued
-  // with plus the cpu time it used since then
   u64 key;
   u32 key_cpu;
+  u32 key_band;
+  u32 boost_band;
   u64 started_at;
 
   u64 granted_slice;
@@ -30,9 +28,7 @@ struct task_ctx
 
 struct dispatch_ctx
 {
-  // band of the task running on this cpu (BAND_AMOUNT: none)
   u64 running_band;
-  // vtime reference per band: the highest key started on this cpu
   u64 band_vtime[BAND_AMOUNT];
   u64 band_head_ts[BAND_AMOUNT];
   u64 last_override_ts;

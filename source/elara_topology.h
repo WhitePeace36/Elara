@@ -56,7 +56,6 @@ inline std::optional<long> read_long_file(const fs::path& p)
   }
 }
 
-// Parse a kernel cpulist such as "0-3,8,10-11" into cpu ids.
 inline std::optional<std::vector<std::uint32_t>> parse_cpulist(const std::string& list)
 {
   std::vector<std::uint32_t> cpus;
@@ -121,11 +120,6 @@ inline std::optional<fs::path> find_cache_level_dir(const fs::path& cpu_dir, lon
   return std::nullopt;
 }
 
-// Build a grouping key for one cache level of one CPU: group by the
-// "shared_cpu_list" string (the cpus that really share this cache), otherwise
-// by the "id" attribute. The id alone is not reliable: QEMU for example gives
-// every cpu its own L3 id although all of them share one L3.
-// nullopt means no usable info at this level.
 inline std::optional<std::string> cache_group_key(const fs::path& cpu_dir, long level)
 {
   const auto index_dir = find_cache_level_dir(cpu_dir, level);
@@ -143,8 +137,6 @@ inline std::optional<std::string> cache_group_key(const fs::path& cpu_dir, long 
 
 }  // namespace detail
 
-// Read the topology from sysfs. cpu_root is overridable for testing and
-// defaults to the real sysfs location.
 inline std::optional<Topology> read_topology(const fs::path& cpu_root = "/sys/devices/system/cpu")
 {
   using namespace detail;
@@ -156,8 +148,6 @@ inline std::optional<Topology> read_topology(const fs::path& cpu_root = "/sys/de
     return std::nullopt;
   }
 
-  // nr_cpu_ids: highest possible CPU id + 1 (matches scx_utils NR_CPU_IDS).
-  // Fall back to the online list if "possible" is unreadable.
   std::uint32_t max_cpu_id = 0;
   const auto possible = read_cpulist_file(cpu_root / "possible");
   const auto& id_source = (possible && !possible->empty()) ? *possible : *online;
@@ -171,9 +161,6 @@ inline std::optional<Topology> read_topology(const fs::path& cpu_root = "/sys/de
   topo.cpu_to_llc.assign(topo.nr_cpu_ids, 0);
   topo.cpu_online.assign(topo.nr_cpu_ids, false);
 
-  // Dense LLC ids, assigned in CPU order over online CPUs only. The key
-  // includes the physical package id like scx_utils' (node, package,
-  // kernel_id) tuple, since kernel cache ids are only meaningful per package.
   std::map<std::string, std::uint32_t> group_to_dense;
 
   for (const auto cpu : *online)

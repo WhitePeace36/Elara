@@ -119,6 +119,21 @@ slice if its band is better than every queued band on its cpu, or if in the same
 its key is not later than the one of the first queued task. Otherwise it goes back into
 its queue.
 
+## Wake boost
+
+When a task wakes a task of a lower band, the woken task runs its next slice in the
+band of the waker. After that slice (or when it goes to sleep before) it is back in its
+own band. That way work a task waits for (a helper thread, wineserver, a kworker that
+submits its gpu job, ...) runs right away instead of behind everything in between. A
+task that needs more than one slice gets no advantage beyond that slice: it is only
+boosted again after it has slept and is woken again.
+
+Only wakeups from normal task context count. A wakeup from an interrupt runs on top of
+whatever task was interrupted, and that task is not the waker. Wakeups by kernel threads
+don't boost either: per-cpu kworkers and ksoftirqd are in band 0 and wake ordinary
+processes for every finished disk read and network packet. This can be changed with
+`WAKE_BOOST_FROM_KTHREADS` in `source/defines.h`.
+
 ## Placement and balancing
 
 When a task wakes up and an idle core is found, it runs there directly.

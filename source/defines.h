@@ -28,13 +28,13 @@
 #define DSQ_BASE 1536
 #define DSQ_BAND_STRIDE 512
 
-// Bands up to this one look through the whole LLC for a cpu to run on, the
-// others only sample BALANCE_SAMPLES cpus.
 #define BAND_SCAN_WHOLE_LLC BAND_1
 
 #define LAG_MAX_NS SLICE_NS
 #define VTIME_BASE (1ULL << 40)
 #define KEY_CPU_NONE ((u32)-1)
+
+#define WAKE_BOOST_FROM_KTHREADS 0
 
 
 #define STARVE_BUDGET_BAND_1_NS (20ULL * NS_PER_MS)

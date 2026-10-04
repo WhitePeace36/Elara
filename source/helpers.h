@@ -111,14 +111,29 @@ static __always_inline u64 elapsed(u64 now, u64 last)
   return now > last ? now - last : 0;
 }
 
-static __always_inline s64 task_lag(struct task_ctx* tctx, u64 band)
+static __always_inline s64 task_lag(struct task_ctx* tctx)
 {
   if (tctx->key_cpu == KEY_CPU_NONE)
     return 0;
   struct dispatch_ctx* from = get_dispatch_ctx(tctx->key_cpu);
   if (!from)
     return 0;
-  return clamp_lag((s64)(tctx->key - band_reference(from, band)));
+  return clamp_lag((s64)(tctx->key - band_reference(from, tctx->key_band)));
+}
+
+static __always_inline void set_task_key(struct task_ctx* tctx, u64 key, u32 cpu, u64 band)
+{
+  tctx->key = key;
+  tctx->key_cpu = cpu;
+  tctx->key_band = band;
+}
+
+static __always_inline u64 effective_band(const struct task_struct* p, struct task_ctx* tctx)
+{
+  u64 band = task_band(p);
+  if (tctx && tctx->boost_band < band)
+    return tctx->boost_band;
+  return band;
 }
 
 #endif  // HELPERS_H
