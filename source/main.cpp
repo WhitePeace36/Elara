@@ -51,7 +51,8 @@ static RunResult run_once()
   }
   SCX_ENUM_INIT(skel);
 
-  skel->struct_ops.elara_ops->hotplug_seq = scx_hotplug_seq();
+  const u64 hotplug_seq = scx_hotplug_seq();
+  skel->struct_ops.elara_ops->hotplug_seq = hotplug_seq;
 
   UEI_SET_SIZE(skel, elara_ops, uei);
 
@@ -79,6 +80,10 @@ static RunResult run_once()
   {
     std::cerr << "Failed to attach BPF programs: " << err << std::endl;
     elara_bpf__destroy(skel);
+    // A cpu went on- or offline between reading the topology and attaching:
+    // not a failure, just start again with the new topology.
+    if (scx_hotplug_seq() != hotplug_seq)
+      return RunResult::Restart;
     return RunResult::Failed;
   }
 

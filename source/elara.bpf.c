@@ -120,13 +120,14 @@ s32 BPF_STRUCT_OPS(elara_select_cpu, struct task_struct* p, s32 prev_cpu, u64 wa
 
   s32 cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
 
-  if (is_idle)
+  // Run directly on the idle cpu, unless tasks of the same or a better band are
+  // already queued there (their kick is still on the way): the local DSQ runs
+  // before them. Otherwise enqueue() queues it properly.
+  u64 band = effective_band(p, tctx);
+  if (is_idle && cpu_load_ahead(cpu, band) == 0)
   {
     if (tctx)
-    {
-      u64 band = effective_band(p, tctx);
       set_task_key(tctx, task_key(get_dispatch_ctx(cpu), band, task_lag(tctx)), cpu, band);
-    }
     scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SLICE_NS, 0);
   }
 
@@ -207,8 +208,12 @@ void BPF_STRUCT_OPS(elara_dispatch, s32 cpu, struct task_struct* prev)
     pctx = get_task_ctx(prev);
     if (pctx && dctx)
     {
-      pctx->boost_band = BAND_AMOUNT;
-      prev_band = task_band(prev);
+      // The slice is over and a wake boost ends with it. A preemption (dispatch
+      // is called before stopping then) keeps the boost: the task gets the
+      // rest of its slice back in the boosted band.
+      if (!dctx->preempt_pending)
+        pctx->boost_band = BAND_AMOUNT;
+      prev_band = effective_band(prev, pctx);
       u64 used = elapsed(now, pctx->started_at);
       pctx->granted_slice = pctx->granted_slice > used ? pctx->granted_slice - used : 0;
       pctx->key += used;
@@ -220,6 +225,16 @@ void BPF_STRUCT_OPS(elara_dispatch, s32 cpu, struct task_struct* prev)
 
   if (!dispatch_dsq_per_cpu(cpu, prev_band, prev_key) || !prev || !pctx || !dctx)
     return;
+
+  // prev keeps running for a new slice, a boost left over from a preemption
+  // that didn't replace it ends here.
+  if (pctx->boost_band != BAND_AMOUNT)
+  {
+    pctx->boost_band = BAND_AMOUNT;
+    prev_band = task_band(prev);
+    prev_key = task_key(dctx, prev_band, task_lag(pctx));
+    set_task_key(pctx, prev_key, cpu, prev_band);
+  }
 
   scx_bpf_task_set_slice(prev, SLICE_NS);
   pctx->granted_slice = SLICE_NS;

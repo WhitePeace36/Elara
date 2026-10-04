@@ -151,10 +151,14 @@ that core takes it over.
 
 ## Dispatch
 
-Each core first runs a starved band if there is one, then its own band 0, then its own
-bands 1, 2, 3 and 4. After that it steals from another core of the same llc and then
-from cores of other llcs, band by band. From which core the core starts stealing is
-randomized for better load distribution.
+Each core first runs a starved band if there is one (not on a dispatch caused by a
+preemption: the task that preempted runs first). Then it looks at the best band it could
+run itself (its running task or its own queues). If a task of a better band waits on
+another core of the same llc, it takes that one over, so the bands are strict across
+cores too. Otherwise it runs its own band 0, then its own bands 1, 2, 3 and 4. After
+that it steals from another core of the same llc and then from cores of other llcs,
+band by band. From which core the core starts stealing is randomized for better load
+distribution.
 
 ## Starvation
 

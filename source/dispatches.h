@@ -39,7 +39,12 @@ static __always_inline s32 pick_enqueue_cpu(struct task_struct* p, struct task_c
 {
   u64 best_load = cpu_load_ahead(cpu, band);
   if (best_load == 0)
+  {
+    // Claim the cpu if it is idle, so no select_cpu() of another wakeup picks
+    // it and puts its task into the local DSQ ahead of this one.
+    scx_bpf_test_and_clear_cpu_idle(cpu);
     return cpu;
+  }
 
   if (p->nr_cpus_allowed == 1)
     return cpu;
@@ -251,7 +256,9 @@ static __always_inline bool dispatch_dsq_per_cpu(u32 cpu, u64 prev_band, u64 pre
   u64 now = bpf_ktime_get_ns();
   int ret;
 
-  if (dctx)
+  // A starved band goes first, but not on a dispatch caused by a preemption:
+  // the task that preempted must run now, the starved band gets the next one.
+  if (dctx && !dctx->preempt_pending)
   {
     u64 starved = most_starved_band(dctx, cpu, now);
     if (starved != BAND_AMOUNT && take_from_local_band(dctx, starved, cpu, now))
@@ -260,6 +267,32 @@ static __always_inline bool dispatch_dsq_per_cpu(u32 cpu, u64 prev_band, u64 pre
       return false;
     }
   }
+
+  // Bands are strict across cpus too: a task of a better band than anything
+  // this cpu could run next (prev or its own queues) and waiting on another cpu
+  // of the LLC is taken over first.
+  // (Written out per band: band numbers that come from a loop variable can
+  // lose their range in the verifier and make array accesses fail.)
+  u64 local_best = prev_band < BAND_AMOUNT ? prev_band : BAND_AMOUNT;
+  if (local_best > BAND_0 && dsq_queued(band_dsq(BAND_0, cpu)))
+    local_best = BAND_0;
+  else if (local_best > BAND_1 && dsq_queued(band_dsq(BAND_1, cpu)))
+    local_best = BAND_1;
+  else if (local_best > BAND_2 && dsq_queued(band_dsq(BAND_2, cpu)))
+    local_best = BAND_2;
+  else if (local_best > BAND_3 && dsq_queued(band_dsq(BAND_3, cpu)))
+    local_best = BAND_3;
+  else if (local_best > BAND_4 && dsq_queued(band_dsq(BAND_4, cpu)))
+    local_best = BAND_4;
+
+  if (local_best > BAND_0 && try_acquire_task_from_other_cpu(BAND_0, cpu, true, now))
+    return false;
+  if (local_best > BAND_1 && try_acquire_task_from_other_cpu(BAND_1, cpu, true, now))
+    return false;
+  if (local_best > BAND_2 && try_acquire_task_from_other_cpu(BAND_2, cpu, true, now))
+    return false;
+  if (local_best > BAND_3 && try_acquire_task_from_other_cpu(BAND_3, cpu, true, now))
+    return false;
 
   if (!(prev_band == BAND_0 && (s64)(prev_key - dsq_head_key(band_dsq(BAND_0, cpu))) <= 0) && take_from_local_band(dctx, BAND_0, cpu, now))
     return false;
