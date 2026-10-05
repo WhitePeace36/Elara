@@ -139,6 +139,12 @@ static __always_inline void set_task_key(struct task_ctx* tctx, u64 key, u32 cpu
   tctx->key_band = band;
 }
 
+static __always_inline void charge_wake_boost(struct task_ctx* tctx, u64 used)
+{
+  if (tctx->boost_band != BAND_AMOUNT)
+    tctx->boost_used += used;
+}
+
 static __always_inline u64 effective_band(const struct task_struct* p, struct task_ctx* tctx)
 {
   u64 band = task_band(p);

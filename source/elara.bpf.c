@@ -85,6 +85,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(elara_init_task, struct task_struct* p, struct scx_
   tctx->key_cpu = KEY_CPU_NONE;
   tctx->key_band = BAND_2;
   tctx->boost_band = BAND_AMOUNT;
+  tctx->boost_used = 0;
   tctx->started_at = now;
   tctx->granted_slice = 0;
   tctx->resume_slice = 0;
@@ -108,7 +109,10 @@ static __always_inline void apply_wake_boost(struct task_struct* p, struct task_
 
   u64 waker_band = effective_band(waker, get_task_ctx(waker));
   if (waker_band < task_band(p) && waker_band < tctx->boost_band)
+  {
     tctx->boost_band = waker_band;
+    tctx->boost_used = 0;
+  }
 }
 
 s32 BPF_STRUCT_OPS(elara_select_cpu, struct task_struct* p, s32 prev_cpu, u64 wake_flags)
@@ -214,13 +218,14 @@ void BPF_STRUCT_OPS(elara_dispatch, s32 cpu, struct task_struct* prev)
     pctx = get_task_ctx(prev);
     if (pctx && dctx)
     {
-      // The slice is over and a wake boost ends with it. A preemption (dispatch
-      // is called before stopping then) keeps the boost: the task gets the
-      // rest of its slice back in the boosted band.
-      if (!dctx->preempt_pending)
+      // The slice is over: a wake boost ends once its budget is used up. A
+      // preemption (dispatch is called before stopping then) keeps the boost:
+      // the task gets the rest of its slice back in the boosted band.
+      u64 used = elapsed(now, pctx->started_at);
+      charge_wake_boost(pctx, used);
+      if (!dctx->preempt_pending && pctx->boost_used >= WAKE_BOOST_BUDGET_NS)
         pctx->boost_band = BAND_AMOUNT;
       prev_band = effective_band(prev, pctx);
-      u64 used = elapsed(now, pctx->started_at);
       pctx->granted_slice = pctx->granted_slice > used ? pctx->granted_slice - used : 0;
       pctx->key += used;
       prev_key = task_key(dctx, prev_band, task_lag(pctx));
@@ -233,8 +238,8 @@ void BPF_STRUCT_OPS(elara_dispatch, s32 cpu, struct task_struct* prev)
     return;
 
   // prev keeps running for a new slice, a boost left over from a preemption
-  // that didn't replace it ends here.
-  if (pctx->boost_band != BAND_AMOUNT)
+  // that didn't replace it ends here once its budget is used up.
+  if (pctx->boost_band != BAND_AMOUNT && pctx->boost_used >= WAKE_BOOST_BUDGET_NS)
   {
     pctx->boost_band = BAND_AMOUNT;
     prev_band = task_band(prev);
@@ -290,11 +295,14 @@ void BPF_STRUCT_OPS(elara_stopping, struct task_struct* task, bool runnable)
 
   u64 used_ns = elapsed(now, tctx->started_at);
   tctx->key += used_ns;
+  charge_wake_boost(tctx, used_ns);
 
   if (dctx->preempt_pending && runnable && task->scx.slice == 0 && tctx->granted_slice > used_ns + RESUME_SLICE_MIN_NS)
     tctx->resume_slice = tctx->granted_slice - used_ns;
 
-  if (!tctx->resume_slice)
+  // A wake boost ends when the task sleeps or its budget is used up, a
+  // preempted task keeps it for the rest of its slice.
+  if (!tctx->resume_slice && (!runnable || tctx->boost_used >= WAKE_BOOST_BUDGET_NS))
     tctx->boost_band = BAND_AMOUNT;
 
   dctx->preempt_pending = false;

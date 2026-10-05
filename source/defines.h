@@ -36,6 +36,11 @@
 
 #define WAKE_BOOST_FROM_KTHREADS 0
 
+// CPU time a woken task keeps the band of its waker for, as long as it doesn't
+// sleep before. Covers work that needs a few slices, without letting a task that
+// keeps running stay in the better band.
+#define WAKE_BOOST_BUDGET_NS (4ULL * NS_PER_MS)
+
 // Load a cpu taken by an RT or deadline task counts as. More than one task: a
 // task of our bands gives the cpu back after at most one slice, an RT task only
 // when it is done.

@@ -124,12 +124,18 @@ its queue.
 
 ## Wake boost
 
-When a task wakes a task of a lower band, the woken task runs its next slice in the
-band of the waker. After that slice (or when it goes to sleep before) it is back in its
-own band. That way work a task waits for (a helper thread, wineserver, a kworker that
-submits its gpu job, ...) runs right away instead of behind everything in between. A
-task that needs more than one slice gets no advantage beyond that slice: it is only
-boosted again after it has slept and is woken again.
+When a task wakes a task of a lower band, the woken task runs in the band of the waker
+until it goes to sleep again, for at most 4ms of cpu time (`WAKE_BOOST_BUDGET_NS`).
+After that it is back in its own band. That way work a task waits for (a helper thread,
+wineserver, a kworker that submits its gpu job, ...) runs right away instead of behind
+everything in between. A task that keeps running gets no advantage beyond the budget: it
+is only boosted again after it has slept and is woken again.
+
+The budget is several slices on purpose. With a boost of only one slice, a woken task
+that needs a bit more than that falls back to its own band with its work unfinished.
+Behind a busy better band it then only runs on the starvation override (one slice per
+50ms in band 2), its next requests pile up while it waits, so it never sleeps and is
+never woken (and boosted) again.
 
 Only wakeups from normal task context count. A wakeup from an interrupt runs on top of
 whatever task was interrupted, and that task is not the waker. Wakeups by kernel threads

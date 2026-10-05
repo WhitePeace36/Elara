@@ -19,6 +19,7 @@ struct task_ctx
   u32 key_cpu;
   u32 key_band;
   u32 boost_band;
+  u64 boost_used;
   u64 started_at;
 
   u64 granted_slice;
