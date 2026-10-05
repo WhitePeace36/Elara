@@ -16,6 +16,9 @@ cmake clang pkgconf libbpf bpf
 
 kernel compiled with flag `CONFIG_DEBUG_INFO_BTF=y`
 
+Linux 6.18 or newer. 7.1 or newer is recommended, older kernels lose parts of the
+realtime handling (see below).
+
 for the kernel option you can just check if `/sys/kernel/btf/vmlinux` is present.
 
 But this kernel option should be enabled by default, but not bad to check never the less.
@@ -148,6 +151,27 @@ Idle cores only look for work when they are woken up. So when a core starts runn
 task while other tasks still wait in its queues (for example the task it just
 preempted), it wakes an idle core that is allowed to run the first waiting task, and
 that core takes it over.
+
+### Realtime and deadline tasks
+
+Tasks with SCHED_FIFO, SCHED_RR or SCHED_DEADLINE (kwin, irq threads, ...) run above
+all bands, outside of elara. A core that runs such a task counts as busy for every
+band, with a load of 2 tasks (`RT_CPU_LOAD`): a task of our bands gives the core back
+after at most one slice, a realtime task only when it is done. The 10ms limit for
+moving tasks doesn't apply to tasks whose own core is taken by a realtime task.
+
+Every switch to a realtime or deadline task is seen by a `sched_switch` tracepoint.
+The tasks waiting on that core then go back through placement, which moves them to a
+core that is free for them: the tasks already picked to run next on the core every time
+(kernel 6.19+), the tasks in its band queues at most once per ms per core
+(`RT_EVACUATE_INTERVAL_NS`, needs kernel 7.1+ for `scx_bpf_dsq_reenq`). An idle core is
+woken for the first task still waiting there. A preempted task that would resume on a
+core taken by a realtime task goes through placement too instead of going back to its
+old place.
+
+Tasks that still wait on such a core are taken over by the other cores: before a core
+runs its own best band, it first takes a task of that same band waiting on a core of
+its llc that is running a realtime task.
 
 ## Dispatch
 

@@ -65,6 +65,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(elara_init)
     }
 
     dispatch_ctx->last_override_ts = now;
+    dispatch_ctx->last_rt_evacuate_ts = 0;
     dispatch_ctx->preempt_pending = false;
   }
 
@@ -144,6 +145,11 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
     apply_wake_boost(p, tctx);
 
   u64 band = effective_band(p, tctx);
+
+  // A preempted task goes back to its own queue with the rest of its slice,
+  // unless its cpu is taken by an RT task now: then it is placed like any other.
+  if (tctx && tctx->resume_slice && cpu_taken_by_rt(cpu))
+    tctx->resume_slice = 0;
 
   if (tctx && tctx->resume_slice)
   {
@@ -308,6 +314,23 @@ void BPF_STRUCT_OPS(elara_quiescent, struct task_struct* p, u64 deq_flags)
 
   tctx->resume_slice = 0;
   tctx->boost_band = BAND_AMOUNT;
+}
+
+// Every context switch: when the next task is an RT or deadline task, the cpu
+// is taken from us, from one of our tasks or from idle. The tasks waiting on it
+// are placed again, and an idle cpu is woken for the first one still waiting.
+// (This replaces ops.cpu_release, which newer kernels deprecate.)
+SEC("tp_btf/sched_switch")
+int BPF_PROG(elara_sched_switch, bool preempt, struct task_struct* prev, struct task_struct* next, unsigned int prev_state)
+{
+  int policy = next->policy;
+  if (policy != SCHED_FIFO && policy != SCHED_RR && policy != SCHED_DEADLINE)
+    return 0;
+
+  u32 cpu = bpf_get_smp_processor_id();
+  evacuate_rt_cpu(cpu, bpf_ktime_get_ns());
+  kick_idle_for_waiting(cpu);
+  return 0;
 }
 
 SCX_OPS_DEFINE(elara_ops,

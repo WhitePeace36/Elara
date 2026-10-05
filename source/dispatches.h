@@ -19,6 +19,11 @@ static __always_inline u64 cpu_load_ahead(u32 cpu, u64 band)
   struct dispatch_ctx* dctx = get_dispatch_ctx(cpu);
   if (dctx && dctx->running_band <= band)
     load++;
+  // A cpu taken by an RT or deadline task is busy for every band. Without this
+  // it looks empty (stopping cleared running_band) and placement would even
+  // prefer it when no cpu is idle.
+  else if (cpu_taken_by_rt(cpu))
+    load += RT_CPU_LOAD;
 
   load += dsq_queued(SCX_DSQ_LOCAL_ON | cpu);
 
@@ -57,8 +62,10 @@ static __always_inline s32 pick_enqueue_cpu(struct task_struct* p, struct task_c
     return idle;
   }
 
+  // The rate limit for moving tasks doesn't apply when the own cpu is taken by
+  // an RT task: the task would wait until that one is done.
   bool scan_whole_llc = band <= BAND_SCAN_WHOLE_LLC;
-  if (!scan_whole_llc && now - tctx->last_migrated_at < BALANCE_INTERVAL_NS)
+  if (!scan_whole_llc && now - tctx->last_migrated_at < BALANCE_INTERVAL_NS && !cpu_taken_by_rt(cpu))
     return cpu;
 
   u32 key = 0;
@@ -135,6 +142,82 @@ static __always_inline bool try_acquire_task_from_other_cpu(u64 band, u32 cpu, b
     }
   }
   return false;
+}
+
+// Take a task of @band from a cpu of the LLC that is taken by an RT or deadline
+// task right now: that cpu can't run it until the RT task is done.
+static __always_inline bool try_acquire_from_rt_cpu(u64 band, u32 cpu, u64 now)
+{
+  u32 my_llc = cpu_llc_id(cpu);
+  u32 nr_cpu_ids = scx_bpf_nr_cpu_ids();
+  u32 start = bpf_get_prandom_u32() % nr_cpu_ids;
+  u32 i;
+
+  bpf_for(i, 0, nr_cpu_ids)
+  {
+    u32 other = (start + i) % nr_cpu_ids;
+    if (other == cpu || !cpu_is_online(other) || cpu_llc_id(other) != my_llc)
+      continue;
+
+    u64 dsq = band_dsq(band, other);
+    if (!dsq_queued(dsq) || !cpu_taken_by_rt(other))
+      continue;
+
+    if (scx_bpf_dsq_move_to_local(dsq, 0))
+    {
+      struct dispatch_ctx* victim = get_dispatch_ctx(other);
+      if (victim)
+        stamp_band_head_ts(victim, band, now);
+      return true;
+    }
+  }
+  return false;
+}
+
+// An RT or deadline task took @cpu. The tasks waiting on it go back through
+// enqueue(), which sees the cpu as busy and places them on another one: the
+// tasks already picked for the cpu (its local DSQ) every time, the band queues
+// at most once per RT_EVACUATE_INTERVAL_NS. Needs the generic re-enqueue of
+// kernel 7.1+ for the band queues.
+static __always_inline void evacuate_rt_cpu(u32 cpu, u64 now)
+{
+  if (dsq_queued(SCX_DSQ_LOCAL_ON | cpu))
+    scx_bpf_reenqueue_local_from_anywhere();
+
+  struct dispatch_ctx* dctx = get_dispatch_ctx(cpu);
+  if (!dctx || now - dctx->last_rt_evacuate_ts < RT_EVACUATE_INTERVAL_NS || !__COMPAT_has_generic_reenq())
+    return;
+
+  bool any = false;
+  if (dsq_queued(band_dsq(BAND_0, cpu)))
+  {
+    scx_bpf_dsq_reenq___compat(band_dsq(BAND_0, cpu), 0);
+    any = true;
+  }
+  if (dsq_queued(band_dsq(BAND_1, cpu)))
+  {
+    scx_bpf_dsq_reenq___compat(band_dsq(BAND_1, cpu), 0);
+    any = true;
+  }
+  if (dsq_queued(band_dsq(BAND_2, cpu)))
+  {
+    scx_bpf_dsq_reenq___compat(band_dsq(BAND_2, cpu), 0);
+    any = true;
+  }
+  if (dsq_queued(band_dsq(BAND_3, cpu)))
+  {
+    scx_bpf_dsq_reenq___compat(band_dsq(BAND_3, cpu), 0);
+    any = true;
+  }
+  if (dsq_queued(band_dsq(BAND_4, cpu)))
+  {
+    scx_bpf_dsq_reenq___compat(band_dsq(BAND_4, cpu), 0);
+    any = true;
+  }
+
+  // Only a pass that moved something uses up the interval.
+  if (any)
+    dctx->last_rt_evacuate_ts = now;
 }
 
 static __always_inline s64 band_overrun(struct dispatch_ctx* dctx, u64 band, u32 cpu, u64 now, u64 budget)
@@ -292,6 +375,19 @@ static __always_inline bool dispatch_dsq_per_cpu(u32 cpu, u64 prev_band, u64 pre
   if (local_best > BAND_2 && try_acquire_task_from_other_cpu(BAND_2, cpu, true, now))
     return false;
   if (local_best > BAND_3 && try_acquire_task_from_other_cpu(BAND_3, cpu, true, now))
+    return false;
+
+  // Tasks of the same band as the best this cpu could run wait on a cpu taken
+  // by an RT task: they can't run there, so they are taken over too.
+  if (local_best == BAND_0 && try_acquire_from_rt_cpu(BAND_0, cpu, now))
+    return false;
+  if (local_best == BAND_1 && try_acquire_from_rt_cpu(BAND_1, cpu, now))
+    return false;
+  if (local_best == BAND_2 && try_acquire_from_rt_cpu(BAND_2, cpu, now))
+    return false;
+  if (local_best == BAND_3 && try_acquire_from_rt_cpu(BAND_3, cpu, now))
+    return false;
+  if (local_best == BAND_4 && try_acquire_from_rt_cpu(BAND_4, cpu, now))
     return false;
 
   if (!(prev_band == BAND_0 && (s64)(prev_key - dsq_head_key(band_dsq(BAND_0, cpu))) <= 0) && take_from_local_band(dctx, BAND_0, cpu, now))

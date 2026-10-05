@@ -106,6 +106,17 @@ static __always_inline bool cpu_is_online(u32 cpu)
   return cpu_online[cpu];
 }
 
+// The cpu runs a task of a higher sched class (RT, deadline) right now. sched_ext
+// tasks don't run there until it is done, even when nothing of ours is running.
+static __always_inline bool cpu_taken_by_rt(u32 cpu)
+{
+  struct task_struct* curr = __COMPAT_scx_bpf_cpu_curr(cpu);
+  if (!curr)
+    return false;
+  int policy = curr->policy;
+  return policy == SCHED_FIFO || policy == SCHED_RR || policy == SCHED_DEADLINE;
+}
+
 static __always_inline u64 elapsed(u64 now, u64 last)
 {
   return now > last ? now - last : 0;
