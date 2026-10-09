@@ -33,7 +33,8 @@ struct dispatch_ctx
   u64 band_vtime[BAND_AMOUNT];
   u64 band_head_ts[BAND_AMOUNT];
   u64 last_override_ts;
-  u64 last_rt_evacuate_ts;
+  u64 override_band;
+  u64 override_left;
   bool preempt_pending;
 };
 

@@ -30,6 +30,11 @@ static __always_inline u64 task_band(const struct task_struct* p)
   if (is_percpu_kthread(p))
     return BAND_0;
 
+  // SCHED_IDLE asks to run only when nothing else wants the cpu: lowest band,
+  // whatever its nice value.
+  if (p->policy == SCHED_IDLE)
+    return BAND_4;
+
   int nice = p->static_prio - NICE_0_PRIO;
 
   if (nice <= BAND_0_MAX_NICE)
@@ -106,15 +111,23 @@ static __always_inline bool cpu_is_online(u32 cpu)
   return cpu_online[cpu];
 }
 
+static __always_inline bool is_rt_task(const struct task_struct* p)
+{
+  // Per-cpu kernel threads with an RT policy (migration/N for every affinity
+  // change and task migration, ...) only run for microseconds: they don't take
+  // the cpu away in a way worth moving tasks for.
+  if (is_percpu_kthread(p))
+    return false;
+  int policy = p->policy;
+  return policy == SCHED_FIFO || policy == SCHED_RR || policy == SCHED_DEADLINE;
+}
+
 // The cpu runs a task of a higher sched class (RT, deadline) right now. sched_ext
 // tasks don't run there until it is done, even when nothing of ours is running.
 static __always_inline bool cpu_taken_by_rt(u32 cpu)
 {
   struct task_struct* curr = __COMPAT_scx_bpf_cpu_curr(cpu);
-  if (!curr)
-    return false;
-  int policy = curr->policy;
-  return policy == SCHED_FIFO || policy == SCHED_RR || policy == SCHED_DEADLINE;
+  return curr && is_rt_task(curr);
 }
 
 static __always_inline u64 elapsed(u64 now, u64 last)
@@ -137,6 +150,15 @@ static __always_inline void set_task_key(struct task_ctx* tctx, u64 key, u32 cpu
   tctx->key = key;
   tctx->key_cpu = cpu;
   tctx->key_band = band;
+}
+
+// Time used by a task of the band a starvation override runs for counts
+// against the override budget.
+static __always_inline void charge_override(struct dispatch_ctx* dctx, u64 band, u64 used)
+{
+  if (!dctx->override_left || band != dctx->override_band)
+    return;
+  dctx->override_left = dctx->override_left > used ? dctx->override_left - used : 0;
 }
 
 static __always_inline void charge_wake_boost(struct task_ctx* tctx, u64 used)

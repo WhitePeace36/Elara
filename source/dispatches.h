@@ -174,50 +174,14 @@ static __always_inline bool try_acquire_from_rt_cpu(u64 band, u32 cpu, u64 now)
   return false;
 }
 
-// An RT or deadline task took @cpu. The tasks waiting on it go back through
-// enqueue(), which sees the cpu as busy and places them on another one: the
-// tasks already picked for the cpu (its local DSQ) every time, the band queues
-// at most once per RT_EVACUATE_INTERVAL_NS. Needs the generic re-enqueue of
-// kernel 7.1+ for the band queues.
-static __always_inline void evacuate_rt_cpu(u32 cpu, u64 now)
+// An RT or deadline task took @cpu: the tasks already picked for it (its local
+// DSQ) go back through enqueue(), which sees the cpu as busy and places them on
+// another one. Tasks waiting in its band queues stay: other cpus take them over
+// in dispatch (try_acquire_from_rt_cpu) when they can run them.
+static __always_inline void evacuate_rt_cpu(u32 cpu)
 {
   if (dsq_queued(SCX_DSQ_LOCAL_ON | cpu))
     scx_bpf_reenqueue_local_from_anywhere();
-
-  struct dispatch_ctx* dctx = get_dispatch_ctx(cpu);
-  if (!dctx || now - dctx->last_rt_evacuate_ts < RT_EVACUATE_INTERVAL_NS || !__COMPAT_has_generic_reenq())
-    return;
-
-  bool any = false;
-  if (dsq_queued(band_dsq(BAND_0, cpu)))
-  {
-    scx_bpf_dsq_reenq___compat(band_dsq(BAND_0, cpu), 0);
-    any = true;
-  }
-  if (dsq_queued(band_dsq(BAND_1, cpu)))
-  {
-    scx_bpf_dsq_reenq___compat(band_dsq(BAND_1, cpu), 0);
-    any = true;
-  }
-  if (dsq_queued(band_dsq(BAND_2, cpu)))
-  {
-    scx_bpf_dsq_reenq___compat(band_dsq(BAND_2, cpu), 0);
-    any = true;
-  }
-  if (dsq_queued(band_dsq(BAND_3, cpu)))
-  {
-    scx_bpf_dsq_reenq___compat(band_dsq(BAND_3, cpu), 0);
-    any = true;
-  }
-  if (dsq_queued(band_dsq(BAND_4, cpu)))
-  {
-    scx_bpf_dsq_reenq___compat(band_dsq(BAND_4, cpu), 0);
-    any = true;
-  }
-
-  // Only a pass that moved something uses up the interval.
-  if (any)
-    dctx->last_rt_evacuate_ts = now;
 }
 
 static __always_inline s64 band_overrun(struct dispatch_ctx* dctx, u64 band, u32 cpu, u64 now, u64 budget)
@@ -341,12 +305,22 @@ static __always_inline bool dispatch_dsq_per_cpu(u32 cpu, u64 prev_band, u64 pre
 
   // A starved band goes first, but not on a dispatch caused by a preemption:
   // the task that preempted must run now, the starved band gets the next one.
+  // It keeps going first until it used its override budget.
   if (dctx && !dctx->preempt_pending)
   {
+    if (dctx->override_left)
+    {
+      if (take_from_local_band(dctx, dctx->override_band, cpu, now))
+        return false;
+      dctx->override_left = 0;
+    }
+
     u64 starved = most_starved_band(dctx, cpu, now);
     if (starved != BAND_AMOUNT && take_from_local_band(dctx, starved, cpu, now))
     {
       dctx->last_override_ts = now;
+      dctx->override_band = starved;
+      dctx->override_left = STARVE_OVERRIDE_BUDGET_NS;
       return false;
     }
   }

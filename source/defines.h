@@ -46,16 +46,15 @@
 // when it is done.
 #define RT_CPU_LOAD 2
 
-// When an RT or deadline task takes a cpu, the tasks waiting in its queues are
-// placed again (kernel 7.1+), at most once per this interval per cpu.
-#define RT_EVACUATE_INTERVAL_NS (1ULL * NS_PER_MS)
-
 // Scheduling policies (include/uapi/linux/sched.h), not part of vmlinux.h
 #ifndef SCHED_FIFO
 #define SCHED_FIFO 1
 #endif
 #ifndef SCHED_RR
 #define SCHED_RR 2
+#endif
+#ifndef SCHED_IDLE
+#define SCHED_IDLE 5
 #endif
 #ifndef SCHED_DEADLINE
 #define SCHED_DEADLINE 6
@@ -68,6 +67,11 @@
 #define STARVE_BUDGET_BAND_4_NS (200ULL * NS_PER_MS)
 
 #define STARVE_OVERRIDE_COOLDOWN_NS (10ULL * NS_PER_MS)
+
+// CPU time a starved band gets per override: its tasks run one after another
+// until it is used up (or the band is empty). One task per override isn't
+// enough: tasks that sleep right away again would use it up in microseconds.
+#define STARVE_OVERRIDE_BUDGET_NS SLICE_NS
 
 #define SLICE_NS (1000 * NS_PER_US)
 

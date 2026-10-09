@@ -65,7 +65,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(elara_init)
     }
 
     dispatch_ctx->last_override_ts = now;
-    dispatch_ctx->last_rt_evacuate_ts = 0;
+    dispatch_ctx->override_band = BAND_AMOUNT;
+    dispatch_ctx->override_left = 0;
     dispatch_ctx->preempt_pending = false;
   }
 
@@ -222,6 +223,7 @@ void BPF_STRUCT_OPS(elara_dispatch, s32 cpu, struct task_struct* prev)
       // preemption (dispatch is called before stopping then) keeps the boost:
       // the task gets the rest of its slice back in the boosted band.
       u64 used = elapsed(now, pctx->started_at);
+      charge_override(dctx, pctx->key_band, used);
       charge_wake_boost(pctx, used);
       if (!dctx->preempt_pending && pctx->boost_used >= WAKE_BOOST_BUDGET_NS)
         pctx->boost_band = BAND_AMOUNT;
@@ -295,6 +297,7 @@ void BPF_STRUCT_OPS(elara_stopping, struct task_struct* task, bool runnable)
 
   u64 used_ns = elapsed(now, tctx->started_at);
   tctx->key += used_ns;
+  charge_override(dctx, tctx->key_band, used_ns);
   charge_wake_boost(tctx, used_ns);
 
   if (dctx->preempt_pending && runnable && task->scx.slice == 0 && tctx->granted_slice > used_ns + RESUME_SLICE_MIN_NS)
@@ -325,18 +328,18 @@ void BPF_STRUCT_OPS(elara_quiescent, struct task_struct* p, u64 deq_flags)
 }
 
 // Every context switch: when the next task is an RT or deadline task, the cpu
-// is taken from us, from one of our tasks or from idle. The tasks waiting on it
-// are placed again, and an idle cpu is woken for the first one still waiting.
+// is taken from us, from one of our tasks or from idle. The tasks already picked
+// for it are placed again, and an idle cpu is woken for the first one still
+// waiting in its queues.
 // (This replaces ops.cpu_release, which newer kernels deprecate.)
 SEC("tp_btf/sched_switch")
 int BPF_PROG(elara_sched_switch, bool preempt, struct task_struct* prev, struct task_struct* next, unsigned int prev_state)
 {
-  int policy = next->policy;
-  if (policy != SCHED_FIFO && policy != SCHED_RR && policy != SCHED_DEADLINE)
+  if (!is_rt_task(next))
     return 0;
 
   u32 cpu = bpf_get_smp_processor_id();
-  evacuate_rt_cpu(cpu, bpf_ktime_get_ns());
+  evacuate_rt_cpu(cpu);
   kick_idle_for_waiting(cpu);
   return 0;
 }

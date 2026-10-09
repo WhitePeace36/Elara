@@ -16,8 +16,8 @@ cmake clang pkgconf libbpf bpf
 
 kernel compiled with flag `CONFIG_DEBUG_INFO_BTF=y`
 
-Linux 6.18 or newer. 7.1 or newer is recommended, older kernels lose parts of the
-realtime handling (see below).
+Linux 6.18 or newer. 6.19 or newer is recommended, 6.18 loses a part of the realtime
+handling (see below).
 
 for the kernel option you can just check if `/sys/kernel/btf/vmlinux` is present.
 
@@ -84,6 +84,10 @@ Kernel threads that are bound to one cpu (ksoftirqd/N, kworker/N:x, rcuc/N, ...)
 go into band 0, whatever their nice value. Only they can do the work of their cpu, so
 they should never wait behind anything. Unbound kernel threads (kworker/u*) and user
 tasks pinned to one cpu are handled by their nice value like everything else.
+
+Tasks with the policy SCHED_IDLE (`chrt -i`, `CPUSchedulingPolicy=idle`) always go into
+band 4, whatever their nice value: they asked to only run when nothing else wants the
+cpu.
 
 Every task has a slice of 1ms. Nice values don't change the slice.
 
@@ -167,13 +171,19 @@ after at most one slice, a realtime task only when it is done. The 10ms limit fo
 moving tasks doesn't apply to tasks whose own core is taken by a realtime task.
 
 Every switch to a realtime or deadline task is seen by a `sched_switch` tracepoint.
-The tasks waiting on that core then go back through placement, which moves them to a
-core that is free for them: the tasks already picked to run next on the core every time
-(kernel 6.19+), the tasks in its band queues at most once per ms per core
-(`RT_EVACUATE_INTERVAL_NS`, needs kernel 7.1+ for `scx_bpf_dsq_reenq`). An idle core is
-woken for the first task still waiting there. A preempted task that would resume on a
-core taken by a realtime task goes through placement too instead of going back to its
+The tasks already picked to run next on that core then go back through placement,
+which moves them to a core that is free for them (kernel 6.19+), and an idle core is
+woken for the first task waiting in its queues. A preempted task that would resume on
+a core taken by a realtime task goes through placement too instead of going back to its
 old place.
+
+The tasks in the band queues of that core are not placed again: realtime tasks often
+run only for microseconds, and moving the queues around on every one of them breaks
+the starvation tracking (a task that keeps being moved never counts as starved).
+
+Per-cpu kernel threads with a realtime policy (migration/N, which runs for every
+affinity change and task migration) don't count as realtime tasks taking the core:
+they only run for microseconds.
 
 Tasks that still wait on such a core are taken over by the other cores: before a core
 runs its own best band, it first takes a task of that same band waiting on a core of
@@ -193,8 +203,12 @@ distribution.
 ## Starvation
 
 If the head of a band has not been served for longer than its budget
-(band 1 20ms, band 2 50ms, band 3 100ms, band 4 200ms), it gets one slice ahead of the
-higher bands, at most once every 10ms per core. Inside a band the vtime makes sure that
+(band 1 20ms, band 2 50ms, band 3 100ms, band 4 200ms), it gets one slice (1ms,
+`STARVE_OVERRIDE_BUDGET_NS`) of cpu time ahead of the higher bands, at most once every
+10ms per core: its tasks run one after another until that time is used up or the band
+is empty. One task per override isn't enough, tasks that sleep again right away (like
+the rcu kthread) would use it up in microseconds, and a cpu bound task of the band
+behind them (kcompactd, an unbound kworker) would never get to run. Inside a band the vtime makes sure that
 nothing starves. The values are in `source/defines.h`.
 
 ## CPU hotplug
