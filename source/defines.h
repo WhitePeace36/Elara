@@ -46,6 +46,13 @@
 // when it is done.
 #define RT_CPU_LOAD 2
 
+// A task waiting on a cpu taken by an RT or deadline task is only taken over by
+// another cpu when it has waited longer than the first task of the same band on
+// that cpu, and at least this long. Raising it (e.g. to SLICE_NS) keeps short RT
+// bursts (kwin, irq threads) from reordering the queues of the neighbours, at
+// the cost of a longer wait for the tasks behind such a burst.
+#define RT_STEAL_MIN_WAIT_NS 0ULL
+
 // Scheduling policies (include/uapi/linux/sched.h), not part of vmlinux.h
 #ifndef SCHED_FIFO
 #define SCHED_FIFO 1

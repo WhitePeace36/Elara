@@ -91,6 +91,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(elara_init_task, struct task_struct* p, struct scx_
   tctx->granted_slice = 0;
   tctx->resume_slice = 0;
   tctx->last_migrated_at = 0;
+  tctx->queued_at = now;
 
   return 0;
 }
@@ -162,6 +163,8 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
     u64 own_dsq = band_dsq(band, cpu);
     struct dispatch_ctx* own = get_dispatch_ctx(cpu);
     tctx->resume_slice = 0;
+    if (!(enq_flags & SCX_ENQ_REENQ))
+      tctx->queued_at = now;
     if (own && band != BAND_0 && dsq_queued(own_dsq) == 0)
       stamp_band_head_ts(own, band, now);
     scx_bpf_dsq_insert_vtime(p, own_dsq, slice, tctx->key, enq_flags);
@@ -176,7 +179,13 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
 
   u64 key = task_key(dctx, band, tctx ? task_lag(tctx) : 0);
   if (tctx)
+  {
     set_task_key(tctx, key, target, band);
+    // A re-enqueue (the cpu was taken by an RT task) keeps the time the task
+    // has already waited.
+    if (!(enq_flags & SCX_ENQ_REENQ))
+      tctx->queued_at = now;
+  }
 
   if (dctx && band != BAND_0 && dsq_queued(dsq) == 0)
     stamp_band_head_ts(dctx, band, now);

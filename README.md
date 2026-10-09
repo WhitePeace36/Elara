@@ -186,8 +186,12 @@ affinity change and task migration) don't count as realtime tasks taking the cor
 they only run for microseconds.
 
 Tasks that still wait on such a core are taken over by the other cores: before a core
-runs its own best band, it first takes a task of that same band waiting on a core of
-its llc that is running a realtime task.
+runs its own best band, it takes a task of that same band waiting on a core of its llc
+that is running a realtime task, if that task has waited longer than the first task of
+that band in its own queue (of all such cores, the task that waited longest). That way
+the tasks behind a realtime task are served in the order they have waited, not always
+before the core's own ones. `RT_STEAL_MIN_WAIT_NS` sets a minimum wait on top (0 by
+default).
 
 ## Dispatch
 

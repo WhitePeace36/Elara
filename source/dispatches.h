@@ -144,34 +144,68 @@ static __always_inline bool try_acquire_task_from_other_cpu(u64 band, u32 cpu, b
   return false;
 }
 
+// How long the first task of @dsq has been waiting, 0 if it is empty.
+static __always_inline u64 dsq_head_wait(u64 dsq, u64 now)
+{
+  struct task_struct* p;
+  u64 wait = 0;
+
+  bpf_for_each(scx_dsq, p, dsq, 0)
+  {
+    struct task_ctx* tctx = get_task_ctx(p);
+    if (tctx)
+      wait = elapsed(now, tctx->queued_at);
+    break;
+  }
+  return wait;
+}
+
 // Take a task of @band from a cpu of the LLC that is taken by an RT or deadline
-// task right now: that cpu can't run it until the RT task is done.
+// task right now: that cpu can't run it until the RT task is done. Only a task
+// that has waited longer than the first task of @band here (and at least
+// RT_STEAL_MIN_WAIT_NS) is taken, the one that waited longest.
 static __always_inline bool try_acquire_from_rt_cpu(u64 band, u32 cpu, u64 now)
 {
   u32 my_llc = cpu_llc_id(cpu);
   u32 nr_cpu_ids = scx_bpf_nr_cpu_ids();
-  u32 start = bpf_get_prandom_u32() % nr_cpu_ids;
   u32 i;
+
+  // The own head is only looked at once there is a candidate at all.
+  bool have_own = false;
+  u64 best_wait = 0;
+  s32 best = -1;
 
   bpf_for(i, 0, nr_cpu_ids)
   {
-    u32 other = (start + i) % nr_cpu_ids;
-    if (other == cpu || !cpu_is_online(other) || cpu_llc_id(other) != my_llc)
+    if (i == cpu || !cpu_is_online(i) || cpu_llc_id(i) != my_llc)
       continue;
 
-    u64 dsq = band_dsq(band, other);
-    if (!dsq_queued(dsq) || !cpu_taken_by_rt(other))
+    u64 dsq = band_dsq(band, i);
+    if (!dsq_queued(dsq) || !cpu_taken_by_rt(i))
       continue;
 
-    if (scx_bpf_dsq_move_to_local(dsq, 0))
+    if (!have_own)
     {
-      struct dispatch_ctx* victim = get_dispatch_ctx(other);
-      if (victim)
-        stamp_band_head_ts(victim, band, now);
-      return true;
+      u64 own_wait = dsq_head_wait(band_dsq(band, cpu), now);
+      best_wait = own_wait > RT_STEAL_MIN_WAIT_NS ? own_wait : RT_STEAL_MIN_WAIT_NS;
+      have_own = true;
+    }
+
+    u64 wait = dsq_head_wait(dsq, now);
+    if (wait > best_wait)
+    {
+      best_wait = wait;
+      best = i;
     }
   }
-  return false;
+
+  if (best < 0 || !scx_bpf_dsq_move_to_local(band_dsq(band, (u32)best), 0))
+    return false;
+
+  struct dispatch_ctx* victim = get_dispatch_ctx((u32)best);
+  if (victim)
+    stamp_band_head_ts(victim, band, now);
+  return true;
 }
 
 // An RT or deadline task took @cpu: the tasks already picked for it (its local

@@ -25,6 +25,8 @@ struct task_ctx
   u64 granted_slice;
   u64 resume_slice;
   u64 last_migrated_at;
+  // when the task was last put into a queue (not reset by a re-enqueue)
+  u64 queued_at;
 };
 
 struct dispatch_ctx
