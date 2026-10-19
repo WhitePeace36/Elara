@@ -11,7 +11,7 @@ So preconfigured stuff will not fit great with this scheduler.
 ## Dependencies
 
 ```
-cmake clang pkgconf libbpf bpf
+cmake (3.20 or newer) clang lld pkgconf libbpf bpf
 ```
 
 kernel compiled with flag `CONFIG_DEBUG_INFO_BTF=y`
@@ -41,6 +41,14 @@ least with nice -11 or lower, so it lands in band 0 and nothing else can delay i
 ```
 ./build.sh
 ```
+
+`build.sh` regenerates `include/vmlinux.h` from the running kernel, and the BPF part is
+rebuilt whenever that file (or any other included header) changed, so after a kernel
+update just run it again.
+
+The loader is built for any cpu of the architecture. To build it with `-march=native`
+(the binary then only runs on cpus like the build machine), configure with
+`-DELARA_NATIVE_ARCH=ON`.
 
 ## Installing
 
@@ -141,6 +149,18 @@ Behind a busy better band it then only runs on the starvation override (one slic
 50ms in band 2), its next requests pile up while it waits, so it never sleeps and is
 never woken (and boosted) again.
 
+The budget is per wakeup, but a task that is woken again right after every boost would
+still run in the better band nearly all the time (a game thread that wineserver in band
+0 keeps answering, for example), and band 0 locks every other band out of its core. So
+the boosted cpu time of a task is also limited over time: each task has a credit of at
+most 4ms that refills at 4ms per 20ms (`WAKE_BOOST_WINDOW_NS`), so at most a fifth of a
+core. A boost gets at most what is left of the credit, and with less than 250us left
+(`WAKE_BOOST_MIN_NS`) there is no boost. Helpers that run shortly are not affected,
+a task that keeps getting woken for a lot of work runs in its own band for the rest.
+
+The waker's own band counts, not a band it runs in because it was boosted itself.
+Otherwise a boost would pass on to everything the boosted task wakes, and from there on.
+
 Only wakeups from normal task context count. A wakeup from an interrupt runs on top of
 whatever task was interrupted, and that task is not the waker. Wakeups by kernel threads
 don't boost either: per-cpu kworkers and ksoftirqd are in band 0 and wake ordinary
@@ -181,17 +201,32 @@ The tasks in the band queues of that core are not placed again: realtime tasks o
 run only for microseconds, and moving the queues around on every one of them breaks
 the starvation tracking (a task that keeps being moved never counts as starved).
 
-Per-cpu kernel threads with a realtime policy (migration/N, which runs for every
-affinity change and task migration) don't count as realtime tasks taking the core:
-they only run for microseconds.
+The per-cpu stopper threads (migration/N, which run for every affinity change and task
+migration) don't count as realtime tasks taking the core: they only run for
+microseconds. Other per-cpu kernel threads with a realtime policy (irq threads bound to
+the core of their irq, rcuc/N, ...) do count, they can run for a long time (threaded
+NAPI, irq storms).
 
-Tasks that still wait on such a core are taken over by the other cores: before a core
-runs its own best band, it takes a task of that same band waiting on a core of its llc
-that is running a realtime task, if that task has waited longer than the first task of
-that band in its own queue (of all such cores, the task that waited longest). That way
-the tasks behind a realtime task are served in the order they have waited, not always
-before the core's own ones. `RT_STEAL_MIN_WAIT_NS` sets a minimum wait on top (0 by
-default).
+Tasks that still wait on such a core are taken over by the other cores. For every band
+it may run next (its own best band and every better one, all bands when it has nothing
+queued), a core first looks at the cores of its llc that are running a realtime task,
+and only then at the other cores. It takes the task that waited longest there, if that
+task has waited longer than the first task of that band in its own queue. That way the
+tasks behind a realtime task are served in the order they have waited, and a core
+without work of its own takes them before stealing from a core that can still run its
+queue itself. `RT_STEAL_MIN_WAIT_NS` sets a minimum wait on top (0 by default).
+
+That only covers the bands a core may run next. Tasks of a lower band waiting on a core
+taken by a realtime task are covered by the starvation budgets (see below): every core
+checks the queues of the cores taken by a realtime task at most every 1ms
+(`RT_RESCUE_INTERVAL_NS`), and takes over the band that waited longest beyond its
+budget there (cores of its own llc first). Without this, a realtime task that runs for a
+long time keeps them waiting until the sched_ext watchdog stops the scheduler after 30s
+(kernels without the sched_ext deadline server, 6.18 and 6.19).
+
+Which cores run a realtime task is tracked by the same `sched_switch` tracepoint, with a
+counter of them (`nr_rt_busy`). While no core runs a realtime task, none of these checks
+run, so they cost nothing then.
 
 ## Dispatch
 
@@ -199,7 +234,8 @@ Each core first runs a starved band if there is one (not on a dispatch caused by
 preemption: the task that preempted runs first). Then it looks at the best band it could
 run itself (its running task or its own queues). If a task of a better band waits on
 another core of the same llc, it takes that one over, so the bands are strict across
-cores too. Otherwise it runs its own band 0, then its own bands 1, 2, 3 and 4. After
+cores too (a task of that band waiting on a core taken by a realtime task first, see
+above). Otherwise it runs its own band 0, then its own bands 1, 2, 3 and 4. After
 that it steals from another core of the same llc and then from cores of other llcs,
 band by band. From which core the core starts stealing is randomized for better load
 distribution.

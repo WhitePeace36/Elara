@@ -45,6 +45,9 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(elara_init)
       return ret;
   }
 
+  // A cpu that already runs an RT task when the scheduler starts doesn't switch
+  // again until that task is done, so it is counted here.
+  nr_rt_busy = 0;
   bpf_for(cpu, 0, nr_cpu_ids)
   {
     struct dispatch_ctx* dispatch_ctx = get_dispatch_ctx(cpu);
@@ -53,6 +56,14 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(elara_init)
 
     u64 now = bpf_ktime_get_ns();
     dispatch_ctx->running_band = BAND_AMOUNT;
+
+    // scx_bpf_cpu_curr() needs an RCU read section, which a sleepable callback
+    // doesn't have by itself.
+    bpf_rcu_read_lock();
+    dispatch_ctx->rt_busy = cpu_is_online(cpu) && cpu_taken_by_rt(cpu);
+    bpf_rcu_read_unlock();
+    if (dispatch_ctx->rt_busy)
+      __sync_fetch_and_add(&nr_rt_busy, 1);
 
     u32 band;
     bpf_for(band, 0, BAND_AMOUNT)
@@ -65,6 +76,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(elara_init)
     }
 
     dispatch_ctx->last_override_ts = now;
+    dispatch_ctx->last_rt_rescue_ts = now;
     dispatch_ctx->override_band = BAND_AMOUNT;
     dispatch_ctx->override_left = 0;
     dispatch_ctx->preempt_pending = false;
@@ -87,6 +99,9 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(elara_init_task, struct task_struct* p, struct scx_
   tctx->key_band = BAND_2;
   tctx->boost_band = BAND_AMOUNT;
   tctx->boost_used = 0;
+  tctx->boost_limit = 0;
+  tctx->boost_credit = WAKE_BOOST_BUDGET_NS;
+  tctx->boost_credit_ts = now;
   tctx->started_at = now;
   tctx->granted_slice = 0;
   tctx->resume_slice = 0;
@@ -109,12 +124,19 @@ static __always_inline void apply_wake_boost(struct task_struct* p, struct task_
   if (!WAKE_BOOST_FROM_KTHREADS && (waker->flags & PF_KTHREAD))
     return;
 
-  u64 waker_band = effective_band(waker, get_task_ctx(waker));
-  if (waker_band < task_band(p) && waker_band < tctx->boost_band)
-  {
-    tctx->boost_band = waker_band;
-    tctx->boost_used = 0;
-  }
+  // The waker's own band, not a boost it runs with itself: otherwise a boost
+  // passes on to everything the boosted task wakes, and from there on.
+  u64 waker_band = task_band(waker);
+  if (waker_band >= task_band(p) || waker_band >= tctx->boost_band)
+    return;
+
+  refill_boost_credit(tctx, bpf_ktime_get_ns());
+  if (tctx->boost_credit < WAKE_BOOST_MIN_NS)
+    return;
+
+  tctx->boost_band = waker_band;
+  tctx->boost_used = 0;
+  tctx->boost_limit = tctx->boost_credit < WAKE_BOOST_BUDGET_NS ? tctx->boost_credit : WAKE_BOOST_BUDGET_NS;
 }
 
 s32 BPF_STRUCT_OPS(elara_select_cpu, struct task_struct* p, s32 prev_cpu, u64 wake_flags)
@@ -234,7 +256,7 @@ void BPF_STRUCT_OPS(elara_dispatch, s32 cpu, struct task_struct* prev)
       u64 used = elapsed(now, pctx->started_at);
       charge_override(dctx, pctx->key_band, used);
       charge_wake_boost(pctx, used);
-      if (!dctx->preempt_pending && pctx->boost_used >= WAKE_BOOST_BUDGET_NS)
+      if (!dctx->preempt_pending && boost_spent(pctx))
         pctx->boost_band = BAND_AMOUNT;
       prev_band = effective_band(prev, pctx);
       pctx->granted_slice = pctx->granted_slice > used ? pctx->granted_slice - used : 0;
@@ -250,7 +272,7 @@ void BPF_STRUCT_OPS(elara_dispatch, s32 cpu, struct task_struct* prev)
 
   // prev keeps running for a new slice, a boost left over from a preemption
   // that didn't replace it ends here once its budget is used up.
-  if (pctx->boost_band != BAND_AMOUNT && pctx->boost_used >= WAKE_BOOST_BUDGET_NS)
+  if (pctx->boost_band != BAND_AMOUNT && boost_spent(pctx))
   {
     pctx->boost_band = BAND_AMOUNT;
     prev_band = task_band(prev);
@@ -314,7 +336,7 @@ void BPF_STRUCT_OPS(elara_stopping, struct task_struct* task, bool runnable)
 
   // A wake boost ends when the task sleeps or its budget is used up, a
   // preempted task keeps it for the rest of its slice.
-  if (!tctx->resume_slice && (!runnable || tctx->boost_used >= WAKE_BOOST_BUDGET_NS))
+  if (!tctx->resume_slice && (!runnable || boost_spent(tctx)))
     tctx->boost_band = BAND_AMOUNT;
 
   dctx->preempt_pending = false;
@@ -344,10 +366,21 @@ void BPF_STRUCT_OPS(elara_quiescent, struct task_struct* p, u64 deq_flags)
 SEC("tp_btf/sched_switch")
 int BPF_PROG(elara_sched_switch, bool preempt, struct task_struct* prev, struct task_struct* next, unsigned int prev_state)
 {
-  if (!is_rt_task(next))
+  u32 cpu = bpf_get_smp_processor_id();
+  struct dispatch_ctx* dctx = get_dispatch_ctx(cpu);
+
+  bool rt = is_rt_task(next);
+  if (dctx && rt != dctx->rt_busy)
+  {
+    dctx->rt_busy = rt;
+    if (rt)
+      __sync_fetch_and_add(&nr_rt_busy, 1);
+    else
+      __sync_fetch_and_sub(&nr_rt_busy, 1);
+  }
+  if (!rt)
     return 0;
 
-  u32 cpu = bpf_get_smp_processor_id();
   evacuate_rt_cpu(cpu);
   kick_idle_for_waiting(cpu);
   return 0;

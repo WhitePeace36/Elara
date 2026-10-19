@@ -1,11 +1,15 @@
-cmake_minimum_required(VERSION 3.16)
+# 3.20: DEPFILE of add_custom_command with Makefile generators
+# (find_program(... REQUIRED) already needs 3.18)
+cmake_minimum_required(VERSION 3.20)
 project(elara LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(LIBBPF REQUIRED libbpf)
+pkg_check_modules(LIBBPF REQUIRED IMPORTED_TARGET libbpf)
+
+option(ELARA_NATIVE_ARCH "Build the loader with -march=native (binary only runs on cpus like the build machine)" OFF)
 
 find_program(CLANG_EXECUTABLE clang REQUIRED)
 find_program(BPFTOOL_EXECUTABLE bpftool REQUIRED)

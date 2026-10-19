@@ -19,7 +19,13 @@ struct task_ctx
   u32 key_cpu;
   u32 key_band;
   u32 boost_band;
+  // cpu time used in the boosted band since the wakeup that boosted it, and how
+  // much of it that boost may use (WAKE_BOOST_BUDGET_NS, less when the credit is low)
   u64 boost_used;
+  u64 boost_limit;
+  // boosted cpu time the task may still use, refilled over WAKE_BOOST_WINDOW_NS
+  u64 boost_credit;
+  u64 boost_credit_ts;
   u64 started_at;
 
   u64 granted_slice;
@@ -35,10 +41,18 @@ struct dispatch_ctx
   u64 band_vtime[BAND_AMOUNT];
   u64 band_head_ts[BAND_AMOUNT];
   u64 last_override_ts;
+  // last time this cpu looked for starved tasks on cpus taken by an RT task
+  u64 last_rt_rescue_ts;
   u64 override_band;
   u64 override_left;
   bool preempt_pending;
+  // this cpu runs an RT or deadline task (as seen by the last sched_switch)
+  bool rt_busy;
 };
+
+// Number of cpus an RT or deadline task runs on right now. Lets dispatch skip
+// looking for such cpus when there are none.
+u64 nr_rt_busy;
 
 struct pick_scratch
 {
@@ -55,6 +69,27 @@ struct
   __type(value, struct pick_scratch);
 
 } pick_scratch_map SEC(".maps");
+
+// Loop state of rescue_starved_from_rt_cpu(). Kept in a map instead of local
+// variables: the verifier tracks locals with their exact values (every band
+// constant), which multiplies the states of the cpu loop beyond its limit.
+struct rescue_scratch
+{
+  s64 worst_overrun;
+  s64 cpu_overrun;
+  u64 worst_band;
+  u64 cpu_band;
+  s32 worst_cpu;
+  u32 worst_same_llc;
+};
+
+struct
+{
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, u32);
+  __type(value, struct rescue_scratch);
+} rescue_scratch_map SEC(".maps");
 
 struct
 {

@@ -113,12 +113,16 @@ static __always_inline bool cpu_is_online(u32 cpu)
 
 static __always_inline bool is_rt_task(const struct task_struct* p)
 {
-  // Per-cpu kernel threads with an RT policy (migration/N for every affinity
-  // change and task migration, ...) only run for microseconds: they don't take
-  // the cpu away in a way worth moving tasks for.
-  if (is_percpu_kthread(p))
-    return false;
   int policy = p->policy;
+
+  // The per-cpu stopper threads (migration/N, run for every affinity change and
+  // task migration) only run for microseconds: they don't take the cpu away in
+  // a way worth moving tasks for. They are the only per-cpu kernel threads with
+  // the highest RT priority. Other per-cpu kernel threads with an RT policy (irq
+  // threads bound to the cpu of their irq, rcuc/N, ktimers/N, ...) count as RT
+  // tasks: they can run for a long time (threaded NAPI, irq storms).
+  if (policy == SCHED_FIFO && p->rt_priority == STOPPER_RT_PRIO && is_percpu_kthread(p))
+    return false;
   return policy == SCHED_FIFO || policy == SCHED_RR || policy == SCHED_DEADLINE;
 }
 
@@ -163,8 +167,27 @@ static __always_inline void charge_override(struct dispatch_ctx* dctx, u64 band,
 
 static __always_inline void charge_wake_boost(struct task_ctx* tctx, u64 used)
 {
-  if (tctx->boost_band != BAND_AMOUNT)
-    tctx->boost_used += used;
+  if (tctx->boost_band == BAND_AMOUNT)
+    return;
+  tctx->boost_used += used;
+  tctx->boost_credit = tctx->boost_credit > used ? tctx->boost_credit - used : 0;
+}
+
+// The boost has used up what it was granted.
+static __always_inline bool boost_spent(const struct task_ctx* tctx)
+{
+  return tctx->boost_used >= tctx->boost_limit;
+}
+
+// Refill the boost credit for the time since the last refill, at a rate of
+// WAKE_BOOST_BUDGET_NS per WAKE_BOOST_WINDOW_NS, up to WAKE_BOOST_BUDGET_NS.
+static __always_inline void refill_boost_credit(struct task_ctx* tctx, u64 now)
+{
+  u64 since = elapsed(now, tctx->boost_credit_ts);
+  u64 add = since >= WAKE_BOOST_WINDOW_NS ? WAKE_BOOST_BUDGET_NS : since * WAKE_BOOST_BUDGET_NS / WAKE_BOOST_WINDOW_NS;
+  u64 credit = tctx->boost_credit + add;
+  tctx->boost_credit = credit < WAKE_BOOST_BUDGET_NS ? credit : WAKE_BOOST_BUDGET_NS;
+  tctx->boost_credit_ts = now;
 }
 
 static __always_inline u64 effective_band(const struct task_struct* p, struct task_ctx* tctx)

@@ -41,6 +41,16 @@
 // keeps running stay in the better band.
 #define WAKE_BOOST_BUDGET_NS (4ULL * NS_PER_MS)
 
+// A task can't use more than WAKE_BOOST_BUDGET_NS of boosted cpu time per
+// WAKE_BOOST_WINDOW_NS, however often it is woken: the credit for it refills at
+// that rate. Without this, a task that is woken again right after its boost ends
+// (by wineserver, pipewire, ...) would run in the better band all the time.
+#define WAKE_BOOST_WINDOW_NS (20ULL * NS_PER_MS)
+
+// No boost when less credit than this is left: it would end before the task got
+// anything done.
+#define WAKE_BOOST_MIN_NS (250ULL * NS_PER_US)
+
 // Load a cpu taken by an RT or deadline task counts as. More than one task: a
 // task of our bands gives the cpu back after at most one slice, an RT task only
 // when it is done.
@@ -67,6 +77,10 @@
 #define SCHED_DEADLINE 6
 #endif
 
+// rt_priority of the per-cpu stopper threads (migration/N): MAX_RT_PRIO - 1,
+// see sched_set_stop_task() in kernel/sched/core.c.
+#define STOPPER_RT_PRIO 99
+
 
 #define STARVE_BUDGET_BAND_1_NS (20ULL * NS_PER_MS)
 #define STARVE_BUDGET_BAND_2_NS (50ULL * NS_PER_MS)
@@ -74,6 +88,10 @@
 #define STARVE_BUDGET_BAND_4_NS (200ULL * NS_PER_MS)
 
 #define STARVE_OVERRIDE_COOLDOWN_NS (10ULL * NS_PER_MS)
+
+// How often a cpu looks at the queues of cpus taken by an RT or deadline task
+// for a band that has waited longer than its starvation budget there.
+#define RT_RESCUE_INTERVAL_NS (1ULL * NS_PER_MS)
 
 // CPU time a starved band gets per override: its tasks run one after another
 // until it is used up (or the band is empty). One task per override isn't

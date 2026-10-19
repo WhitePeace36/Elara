@@ -1,3 +1,4 @@
+#!/bin/bash
 set -u
 
 # --- colors (degrade gracefully when output isn't a terminal) ---
