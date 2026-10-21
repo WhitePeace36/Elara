@@ -15,12 +15,17 @@ const volatile u8 cpu_online[MAX_CPUS] = {};
 
 struct task_ctx
 {
+  // deadline in ns (see SLACK_NICE_0_NS) of the task in its queue, or of its
+  // current slice while it runs, and its key (order in its cpu's queue)
+  u64 deadline;
   u64 key;
-  u32 key_cpu;
-  u32 key_band;
-  u32 boost_band;
-  // cpu time used in the boosted band since the wakeup that boosted it, and how
-  // much of it that boost may use (WAKE_BOOST_BUDGET_NS, less when the credit is low)
+  // weighted cpu time, relative to the vtime reference of vtime_cpu
+  u64 vtime;
+  u32 vtime_cpu;
+  // slack taken over from the waker by a wake boost (0: no boost)
+  u64 boost_slack;
+  // cpu time used with the boost since the wakeup that boosted it, and how much
+  // of it that boost may use (WAKE_BOOST_BUDGET_NS, less when the credit is low)
   u64 boost_used;
   u64 boost_limit;
   // boosted cpu time the task may still use, refilled over WAKE_BOOST_WINDOW_NS
@@ -31,20 +36,17 @@ struct task_ctx
   u64 granted_slice;
   u64 resume_slice;
   u64 last_migrated_at;
-  // when the task was last put into a queue (not reset by a re-enqueue)
-  u64 queued_at;
 };
 
 struct dispatch_ctx
 {
-  u64 running_band;
-  u64 band_vtime[BAND_AMOUNT];
-  u64 band_head_ts[BAND_AMOUNT];
-  u64 last_override_ts;
-  // last time this cpu looked for starved tasks on cpus taken by an RT task
-  u64 last_rt_rescue_ts;
-  u64 override_band;
-  u64 override_left;
+  // deadline and key of the task running on this cpu (DEADLINE_NONE: none of ours)
+  u64 running_deadline;
+  u64 running_key;
+  // highest vtime of a task that started running on this cpu
+  u64 vtime_ref;
+  // last time this cpu looked for overdue tasks in its queue
+  u64 last_starve_check;
   bool preempt_pending;
   // this cpu runs an RT or deadline task (as seen by the last sched_switch)
   bool rt_busy;
@@ -67,20 +69,15 @@ struct
   __uint(max_entries, 1);
   __type(key, u32);
   __type(value, struct pick_scratch);
-
 } pick_scratch_map SEC(".maps");
 
-// Loop state of rescue_starved_from_rt_cpu(). Kept in a map instead of local
-// variables: the verifier tracks locals with their exact values (every band
-// constant), which multiplies the states of the cpu loop beyond its limit.
-struct rescue_scratch
+// Loop state of find_earliest(). Kept in a map instead of local variables: the
+// verifier tracks locals with their exact values, which multiplies the states of
+// the cpu loop.
+struct steal_scratch
 {
-  s64 worst_overrun;
-  s64 cpu_overrun;
-  u64 worst_band;
-  u64 cpu_band;
-  s32 worst_cpu;
-  u32 worst_same_llc;
+  u64 best_deadline;
+  s32 best_cpu;
 };
 
 struct
@@ -88,8 +85,8 @@ struct
   __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
   __uint(max_entries, 1);
   __type(key, u32);
-  __type(value, struct rescue_scratch);
-} rescue_scratch_map SEC(".maps");
+  __type(value, struct steal_scratch);
+} steal_scratch_map SEC(".maps");
 
 struct
 {

@@ -28,19 +28,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(elara_init)
   u32 cpu;
   bpf_for(cpu, 0, nr_cpu_ids)
   {
-    ret = scx_bpf_create_dsq(band_dsq(BAND_0, cpu), -1);
-    if (ret)
-      return ret;
-    ret = scx_bpf_create_dsq(band_dsq(BAND_1, cpu), -1);
-    if (ret)
-      return ret;
-    ret = scx_bpf_create_dsq(band_dsq(BAND_2, cpu), -1);
-    if (ret)
-      return ret;
-    ret = scx_bpf_create_dsq(band_dsq(BAND_3, cpu), -1);
-    if (ret)
-      return ret;
-    ret = scx_bpf_create_dsq(band_dsq(BAND_4, cpu), -1);
+    ret = scx_bpf_create_dsq(cpu_dsq(cpu), -1);
     if (ret)
       return ret;
   }
@@ -54,8 +42,11 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(elara_init)
     if (!dispatch_ctx)
       return -ENOMEM;
 
-    u64 now = bpf_ktime_get_ns();
-    dispatch_ctx->running_band = BAND_AMOUNT;
+    dispatch_ctx->running_deadline = DEADLINE_NONE;
+    dispatch_ctx->running_key = DEADLINE_NONE;
+    dispatch_ctx->vtime_ref = VTIME_BASE;
+    dispatch_ctx->last_starve_check = 0;
+    dispatch_ctx->preempt_pending = false;
 
     // scx_bpf_cpu_curr() needs an RCU read section, which a sleepable callback
     // doesn't have by itself.
@@ -64,22 +55,6 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(elara_init)
     bpf_rcu_read_unlock();
     if (dispatch_ctx->rt_busy)
       __sync_fetch_and_add(&nr_rt_busy, 1);
-
-    u32 band;
-    bpf_for(band, 0, BAND_AMOUNT)
-    {
-      if (band < BAND_AMOUNT)
-      {
-        dispatch_ctx->band_vtime[band] = VTIME_BASE;
-        dispatch_ctx->band_head_ts[band] = now;
-      }
-    }
-
-    dispatch_ctx->last_override_ts = now;
-    dispatch_ctx->last_rt_rescue_ts = now;
-    dispatch_ctx->override_band = BAND_AMOUNT;
-    dispatch_ctx->override_left = 0;
-    dispatch_ctx->preempt_pending = false;
   }
 
   return 0;
@@ -94,10 +69,11 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(elara_init_task, struct task_struct* p, struct scx_
   if (!tctx)
     return -ENOMEM;
 
+  tctx->deadline = now;
   tctx->key = VTIME_BASE;
-  tctx->key_cpu = KEY_CPU_NONE;
-  tctx->key_band = BAND_2;
-  tctx->boost_band = BAND_AMOUNT;
+  tctx->vtime = VTIME_BASE;
+  tctx->vtime_cpu = VTIME_CPU_NONE;
+  tctx->boost_slack = 0;
   tctx->boost_used = 0;
   tctx->boost_limit = 0;
   tctx->boost_credit = WAKE_BOOST_BUDGET_NS;
@@ -106,13 +82,14 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(elara_init_task, struct task_struct* p, struct scx_
   tctx->granted_slice = 0;
   tctx->resume_slice = 0;
   tctx->last_migrated_at = 0;
-  tctx->queued_at = now;
 
   return 0;
 }
 
 void BPF_STRUCT_OPS(elara_exit_task, struct task_struct* p, struct scx_exit_task_args* args) { }
 
+// Wake boost: a task woken by a task with a shorter slack takes over that slack
+// until it sleeps again, for a limited amount of cpu time.
 static __always_inline void apply_wake_boost(struct task_struct* p, struct task_ctx* tctx)
 {
   if (!bpf_in_task())
@@ -124,19 +101,34 @@ static __always_inline void apply_wake_boost(struct task_struct* p, struct task_
   if (!WAKE_BOOST_FROM_KTHREADS && (waker->flags & PF_KTHREAD))
     return;
 
-  // The waker's own band, not a boost it runs with itself: otherwise a boost
+  // The waker's own slack, not a boost it runs with itself: otherwise a boost
   // passes on to everything the boosted task wakes, and from there on.
-  u64 waker_band = task_band(waker);
-  if (waker_band >= task_band(p) || waker_band >= tctx->boost_band)
+  u64 waker_slack = task_slack(waker);
+  if (waker_slack >= task_slack(p) || (tctx->boost_slack && waker_slack >= tctx->boost_slack))
     return;
 
   refill_boost_credit(tctx, bpf_ktime_get_ns());
   if (tctx->boost_credit < WAKE_BOOST_MIN_NS)
     return;
 
-  tctx->boost_band = waker_band;
+  tctx->boost_slack = waker_slack;
   tctx->boost_used = 0;
   tctx->boost_limit = tctx->boost_credit < WAKE_BOOST_BUDGET_NS ? tctx->boost_credit : WAKE_BOOST_BUDGET_NS;
+}
+
+// Set the key and deadline a task is queued with on @cpu: its lag moves along
+// to @cpu, @slack is the slack for this time in the queue.
+static __always_inline void set_queue_keys(struct task_ctx* tctx, u32 cpu, u64 now, u64 slack, s64 lag)
+{
+  rebase_vtime(tctx, cpu, lag);
+  tctx->key = tctx->vtime + slack;
+  tctx->deadline = make_deadline(now, slack, lag);
+}
+
+// Slack of a task for the time in the queue after a wakeup.
+static __always_inline u64 wakeup_slack(struct task_struct* p, struct task_ctx* tctx)
+{
+  return effective_slack(p, tctx) / WAKE_SLACK_DIV;
 }
 
 s32 BPF_STRUCT_OPS(elara_select_cpu, struct task_struct* p, s32 prev_cpu, u64 wake_flags)
@@ -149,15 +141,19 @@ s32 BPF_STRUCT_OPS(elara_select_cpu, struct task_struct* p, s32 prev_cpu, u64 wa
 
   s32 cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
 
-  // Run directly on the idle cpu, unless tasks of the same or a better band are
+  // Run directly on the idle cpu, unless tasks with an earlier deadline are
   // already queued there (their kick is still on the way): the local DSQ runs
   // before them. Otherwise enqueue() queues it properly.
-  u64 band = effective_band(p, tctx);
-  if (is_idle && cpu_load_ahead(cpu, band) == 0)
+  if (is_idle && tctx)
   {
-    if (tctx)
-      set_task_key(tctx, task_key(get_dispatch_ctx(cpu), band, task_lag(tctx)), cpu, band);
-    scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SLICE_NS, 0);
+    u64 now = bpf_ktime_get_ns();
+    u64 slack = wakeup_slack(p, tctx);
+    s64 lag = task_lag(p, tctx);
+    if (cpu_load_ahead(cpu, make_deadline(now, slack, lag), true) == 0)
+    {
+      set_queue_keys(tctx, cpu, now, slack, lag);
+      scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SLICE_NS, 0);
+    }
   }
 
   return cpu;
@@ -169,65 +165,59 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
   u32 cpu = scx_bpf_task_cpu(p);
   u64 now = bpf_ktime_get_ns();
 
-  if (tctx && (enq_flags & SCX_ENQ_WAKEUP))
+  if (!tctx)
+  {
+    scx_bpf_dsq_insert_vtime(p, cpu_dsq(cpu), SLICE_NS, cpu_vtime_ref(cpu) + task_slack(p), enq_flags);
+    scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+    return;
+  }
+
+  if (enq_flags & SCX_ENQ_WAKEUP)
     apply_wake_boost(p, tctx);
 
-  u64 band = effective_band(p, tctx);
-
-  // A preempted task goes back to its own queue with the rest of its slice,
-  // unless its cpu is taken by an RT task now: then it is placed like any other.
-  if (tctx && tctx->resume_slice && cpu_taken_by_rt(cpu))
+  // A preempted task goes back to its own queue with the rest of its slice, its
+  // key and deadline, unless its cpu is taken by an RT task now: then it is
+  // placed like any other.
+  if (tctx->resume_slice && cpu_taken_by_rt(cpu))
     tctx->resume_slice = 0;
 
-  if (tctx && tctx->resume_slice)
+  if (tctx->resume_slice)
   {
     u64 slice = tctx->resume_slice;
-    u64 own_dsq = band_dsq(band, cpu);
-    struct dispatch_ctx* own = get_dispatch_ctx(cpu);
     tctx->resume_slice = 0;
-    if (!(enq_flags & SCX_ENQ_REENQ))
-      tctx->queued_at = now;
-    if (own && band != BAND_0 && dsq_queued(own_dsq) == 0)
-      stamp_band_head_ts(own, band, now);
-    scx_bpf_dsq_insert_vtime(p, own_dsq, slice, tctx->key, enq_flags);
+    scx_bpf_dsq_insert_vtime(p, cpu_dsq(cpu), slice, tctx->key, enq_flags);
     return;
   }
 
-  u32 target = tctx ? (u32)pick_enqueue_cpu(p, tctx, band, cpu, now) : cpu;
+  u64 slack = (enq_flags & SCX_ENQ_WAKEUP) ? wakeup_slack(p, tctx) : effective_slack(p, tctx);
+  s64 lag = task_lag(p, tctx);
+  // A re-enqueue (the cpu was taken by an RT task) keeps the deadline: the task
+  // has already waited for it.
+  bool reenq = enq_flags & SCX_ENQ_REENQ;
+  u64 deadline = reenq ? tctx->deadline : make_deadline(now, slack, lag);
+
+  // A woken task goes where it runs soonest, a task that comes back after its
+  // slice is balanced by weight.
+  u32 target = (enq_flags & SCX_ENQ_WAKEUP) ? (u32)pick_enqueue_cpu(p, tctx, deadline, slack, cpu, now, true)
+                                            : (u32)pick_balance_cpu(p, tctx, slack, cpu, now);
   if (!cpu_is_online(target))
     target = cpu;
-  u64 dsq = band_dsq(band, target);
+
+  set_queue_keys(tctx, target, now, slack, lag);
+  if (reenq)
+    tctx->deadline = deadline;
+  scx_bpf_dsq_insert_vtime(p, cpu_dsq(target), SLICE_NS, tctx->key, enq_flags);
+
   struct dispatch_ctx* dctx = get_dispatch_ctx(target);
-
-  u64 key = task_key(dctx, band, tctx ? task_lag(tctx) : 0);
-  if (tctx)
-  {
-    set_task_key(tctx, key, target, band);
-    // A re-enqueue (the cpu was taken by an RT task) keeps the time the task
-    // has already waited.
-    if (!(enq_flags & SCX_ENQ_REENQ))
-      tctx->queued_at = now;
-  }
-
-  if (dctx && band != BAND_0 && dsq_queued(dsq) == 0)
-    stamp_band_head_ts(dctx, band, now);
-
-  scx_bpf_dsq_insert_vtime(p, dsq, SLICE_NS, key, enq_flags);
-
-  if (!dctx)
+  if (!dctx || dctx->running_deadline == DEADLINE_NONE)
   {
     scx_bpf_kick_cpu(target, SCX_KICK_IDLE);
     return;
   }
 
-  u64 running_band = dctx->running_band;
-  if (running_band >= BAND_AMOUNT)
-  {
-    scx_bpf_kick_cpu(target, SCX_KICK_IDLE);
-    return;
-  }
-
-  if ((enq_flags & SCX_ENQ_WAKEUP) && band < running_band)
+  // Keys of the same cpu compare: preempt the running task when the woken one is
+  // clearly earlier.
+  if ((enq_flags & SCX_ENQ_WAKEUP) && tctx->key + PREEMPT_MARGIN_NS < dctx->running_key)
   {
     dctx->preempt_pending = true;
     scx_bpf_kick_cpu(target, SCX_KICK_PREEMPT);
@@ -239,8 +229,8 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
 
 void BPF_STRUCT_OPS(elara_dispatch, s32 cpu, struct task_struct* prev)
 {
-  u64 prev_band = BAND_AMOUNT;
-  u64 prev_key = (u64)-1;
+  u64 prev_key = DEADLINE_NONE;
+  u64 prev_deadline = DEADLINE_NONE;
   struct task_ctx* pctx = NULL;
   struct dispatch_ctx* dctx = get_dispatch_ctx(cpu);
   u64 now = bpf_ktime_get_ns();
@@ -251,39 +241,54 @@ void BPF_STRUCT_OPS(elara_dispatch, s32 cpu, struct task_struct* prev)
     if (pctx && dctx)
     {
       // The slice is over: a wake boost ends once its budget is used up. A
-      // preemption (dispatch is called before stopping then) keeps the boost:
-      // the task gets the rest of its slice back in the boosted band.
+      // preemption (dispatch is called before stopping then) keeps the boost,
+      // key and deadline: the task gets the rest of its slice back.
       u64 used = elapsed(now, pctx->started_at);
-      charge_override(dctx, pctx->key_band, used);
       charge_wake_boost(pctx, used);
+      charge_vtime(prev, pctx, used);
       if (!dctx->preempt_pending && boost_spent(pctx))
-        pctx->boost_band = BAND_AMOUNT;
-      prev_band = effective_band(prev, pctx);
+        pctx->boost_slack = 0;
       pctx->granted_slice = pctx->granted_slice > used ? pctx->granted_slice - used : 0;
-      pctx->key += used;
-      prev_key = task_key(dctx, prev_band, task_lag(pctx));
-      set_task_key(pctx, prev_key, cpu, prev_band);
       pctx->started_at = now;
+      if (dctx->preempt_pending)
+      {
+        prev_key = pctx->key;
+        prev_deadline = pctx->deadline;
+      }
+      else
+      {
+        u64 slack = effective_slack(prev, pctx);
+        prev_key = pctx->vtime + slack;
+        prev_deadline = make_deadline(now, slack, task_lag(prev, pctx));
+      }
     }
   }
 
-  if (!dispatch_dsq_per_cpu(cpu, prev_band, prev_key) || !prev || !pctx || !dctx)
+  if (!dispatch_dsq_per_cpu(cpu, prev_key, prev_deadline) || !prev || !pctx || !dctx)
     return;
 
   // prev keeps running for a new slice, a boost left over from a preemption
   // that didn't replace it ends here once its budget is used up.
-  if (pctx->boost_band != BAND_AMOUNT && boost_spent(pctx))
+  if (pctx->boost_slack && boost_spent(pctx))
   {
-    pctx->boost_band = BAND_AMOUNT;
-    prev_band = task_band(prev);
-    prev_key = task_key(dctx, prev_band, task_lag(pctx));
-    set_task_key(pctx, prev_key, cpu, prev_band);
+    pctx->boost_slack = 0;
+    u64 slack = task_slack(prev);
+    prev_key = pctx->vtime + slack;
+    prev_deadline = make_deadline(now, slack, task_lag(prev, pctx));
   }
 
+  // The vtime reference follows the running task also when it keeps the cpu:
+  // otherwise a task that runs alone for long builds up a lag against its own
+  // cpu and carries it along as debt when it moves.
+  if ((s64)(pctx->vtime - dctx->vtime_ref) > 0)
+    dctx->vtime_ref = pctx->vtime;
+
+  pctx->key = prev_key;
+  pctx->deadline = prev_deadline;
   scx_bpf_task_set_slice(prev, SLICE_NS);
   pctx->granted_slice = SLICE_NS;
-  advance_band_reference(dctx, prev_band, prev_key);
-  dctx->running_band = prev_band;
+  dctx->running_key = prev_key;
+  dctx->running_deadline = prev_deadline;
   dctx->preempt_pending = false;
 }
 
@@ -298,13 +303,19 @@ void BPF_STRUCT_OPS(elara_running, struct task_struct* p)
   if (!dispatch_ctx)
     return;
 
-  u64 band = effective_band(p, context);
+  // A task taken over from another cpu brings its lag along, its key moves to
+  // the vtime of this cpu.
+  if (context->vtime_cpu != cpu)
+  {
+    u64 slack = context->key - context->vtime;
+    rebase_vtime(context, cpu, task_lag(p, context));
+    context->key = context->vtime + slack;
+  }
+  if ((s64)(context->vtime - dispatch_ctx->vtime_ref) > 0)
+    dispatch_ctx->vtime_ref = context->vtime;
 
-  if (context->key_cpu != cpu || context->key_band != band)
-    set_task_key(context, task_key(dispatch_ctx, band, task_lag(context)), cpu, band);
-
-  advance_band_reference(dispatch_ctx, band, context->key);
-  dispatch_ctx->running_band = band;
+  dispatch_ctx->running_key = context->key;
+  dispatch_ctx->running_deadline = context->deadline;
   dispatch_ctx->preempt_pending = false;
 
   context->started_at = bpf_ktime_get_ns();
@@ -327,9 +338,8 @@ void BPF_STRUCT_OPS(elara_stopping, struct task_struct* task, bool runnable)
     return;
 
   u64 used_ns = elapsed(now, tctx->started_at);
-  tctx->key += used_ns;
-  charge_override(dctx, tctx->key_band, used_ns);
   charge_wake_boost(tctx, used_ns);
+  charge_vtime(task, tctx, used_ns);
 
   if (dctx->preempt_pending && runnable && task->scx.slice == 0 && tctx->granted_slice > used_ns + RESUME_SLICE_MIN_NS)
     tctx->resume_slice = tctx->granted_slice - used_ns;
@@ -337,10 +347,11 @@ void BPF_STRUCT_OPS(elara_stopping, struct task_struct* task, bool runnable)
   // A wake boost ends when the task sleeps or its budget is used up, a
   // preempted task keeps it for the rest of its slice.
   if (!tctx->resume_slice && (!runnable || boost_spent(tctx)))
-    tctx->boost_band = BAND_AMOUNT;
+    tctx->boost_slack = 0;
 
   dctx->preempt_pending = false;
-  dctx->running_band = BAND_AMOUNT;
+  dctx->running_deadline = DEADLINE_NONE;
+  dctx->running_key = DEADLINE_NONE;
 }
 
 void BPF_STRUCT_OPS(elara_exit, struct scx_exit_info* ei)
@@ -355,13 +366,13 @@ void BPF_STRUCT_OPS(elara_quiescent, struct task_struct* p, u64 deq_flags)
     return;
 
   tctx->resume_slice = 0;
-  tctx->boost_band = BAND_AMOUNT;
+  tctx->boost_slack = 0;
 }
 
 // Every context switch: when the next task is an RT or deadline task, the cpu
 // is taken from us, from one of our tasks or from idle. The tasks already picked
 // for it are placed again, and an idle cpu is woken for the first one still
-// waiting in its queues.
+// waiting in its queue.
 // (This replaces ops.cpu_release, which newer kernels deprecate.)
 SEC("tp_btf/sched_switch")
 int BPF_PROG(elara_sched_switch, bool preempt, struct task_struct* prev, struct task_struct* next, unsigned int prev_state)

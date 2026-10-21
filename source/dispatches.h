@@ -12,37 +12,172 @@
 #include "datatypes.h"
 #include "helpers.h"
 
-static __always_inline u64 cpu_load_ahead(u32 cpu, u64 band)
+static __always_inline u64 task_deadline(struct task_struct* p)
+{
+  struct task_ctx* tctx = get_task_ctx(p);
+  return tctx ? tctx->deadline : DEADLINE_NONE;
+}
+
+// Deadline of the first task in @dsq, DEADLINE_NONE if it is empty.
+static __always_inline u64 dsq_head_deadline(u64 dsq)
+{
+  struct task_struct* p;
+  u64 deadline = DEADLINE_NONE;
+
+  bpf_for_each(scx_dsq, p, dsq, 0)
+  {
+    deadline = task_deadline(p);
+    break;
+  }
+  return deadline;
+}
+
+// Key of the first task in @dsq, DEADLINE_NONE if it is empty.
+static __always_inline u64 dsq_head_key(u64 dsq)
+{
+  struct task_struct* p;
+  u64 key = DEADLINE_NONE;
+
+  bpf_for_each(scx_dsq, p, dsq, 0)
+  {
+    key = p->scx.dsq_vtime;
+    break;
+  }
+  return key;
+}
+
+// ---------------------------------------------------------------------------
+// Placement
+// ---------------------------------------------------------------------------
+
+// How much work would run on @cpu before a task with @deadline. @wakeup: the
+// task is woken up and may preempt.
+static __always_inline u64 cpu_load_ahead(u32 cpu, u64 deadline, bool wakeup)
 {
   u64 load = 0;
 
   struct dispatch_ctx* dctx = get_dispatch_ctx(cpu);
-  if (dctx && dctx->running_band <= band)
-    load++;
-  // A cpu taken by an RT or deadline task is busy for every band. Without this
-  // it looks empty (stopping cleared running_band) and placement would even
+  if (dctx && dctx->running_deadline != DEADLINE_NONE)
+  {
+    // The running task finishes its slice, unless the new one is woken and
+    // preempts it. A task that comes back after its slice doesn't preempt:
+    // counting the running task as gone would make it move to a cpu where it
+    // waits just as long, and leave its own cpu to worse tasks.
+    if (!wakeup || dctx->running_deadline <= deadline + PREEMPT_MARGIN_NS)
+      load++;
+  }
+  // A cpu taken by an RT or deadline task is busy for everything. Without this
+  // it looks empty (stopping cleared running_deadline) and placement would even
   // prefer it when no cpu is idle.
   else if (cpu_taken_by_rt(cpu))
     load += RT_CPU_LOAD;
 
   load += dsq_queued(SCX_DSQ_LOCAL_ON | cpu);
 
-  load += dsq_queued(band_dsq(BAND_0, cpu));
-  if (band >= BAND_1)
-    load += dsq_queued(band_dsq(BAND_1, cpu));
-  if (band >= BAND_2)
-    load += dsq_queued(band_dsq(BAND_2, cpu));
-  if (band >= BAND_3)
-    load += dsq_queued(band_dsq(BAND_3, cpu));
-  if (band >= BAND_4)
-    load += dsq_queued(band_dsq(BAND_4, cpu));
+  u64 dsq = cpu_dsq(cpu);
+  u64 queued = dsq_queued(dsq);
+  if (queued && dsq_head_deadline(dsq) <= deadline)
+    load += queued;
 
   return load;
 }
 
-static __always_inline s32 pick_enqueue_cpu(struct task_struct* p, struct task_ctx* tctx, u64 band, u32 cpu, u64 now)
+// Weight of the tasks on @cpu other than @self: the running one (an RT or
+// deadline task counts as RT_CPU_WEIGHT), the ones already picked for it and the
+// queued ones.
+static __always_inline u64 cpu_weight_load(u32 cpu, struct task_struct* self)
 {
-  u64 best_load = cpu_load_ahead(cpu, band);
+  u64 load = 0;
+  u32 summed = 0;
+  struct task_struct* q;
+
+  struct task_struct* curr = __COMPAT_scx_bpf_cpu_curr(cpu);
+  if (curr && curr != self && curr->pid)
+    load += is_rt_task(curr) ? RT_CPU_WEIGHT : curr->scx.weight;
+
+  load += dsq_queued(SCX_DSQ_LOCAL_ON | cpu) * NICE_0_WEIGHT;
+
+  u64 dsq = cpu_dsq(cpu);
+  bpf_for_each(scx_dsq, q, dsq, 0)
+  {
+    if (q != self)
+      load += q->scx.weight;
+    if (++summed >= WEIGHT_SCAN_DEPTH)
+      break;
+  }
+  u64 queued = dsq_queued(dsq);
+  if (queued > summed)
+    load += (queued - summed) * NICE_0_WEIGHT;
+
+  return load;
+}
+
+// Cpu for a task that comes back after its slice: balanced by weight (see
+// RT_CPU_WEIGHT), at most once every BALANCE_INTERVAL_NS, unless its own cpu is
+// taken by an RT task.
+static __always_inline s32 pick_balance_cpu(struct task_struct* p, struct task_ctx* tctx, u64 slack, u32 cpu, u64 now)
+{
+  if (p->nr_cpus_allowed == 1)
+    return cpu;
+
+  s32 idle = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
+  if (idle >= 0)
+  {
+    if ((u32)idle != cpu)
+      tctx->last_migrated_at = now;
+    return idle;
+  }
+
+  bool scan_whole_llc = slack <= SCAN_WHOLE_LLC_SLACK_NS;
+  if (!scan_whole_llc && now - tctx->last_migrated_at < BALANCE_INTERVAL_NS && !cpu_taken_by_rt(cpu))
+    return cpu;
+
+  u32 key = 0;
+  struct pick_scratch* sc = bpf_map_lookup_elem(&pick_scratch_map, &key);
+  if (!sc)
+    return cpu;
+
+  u64 margin = (p->scx.weight ? p->scx.weight : 1) / 2;
+  sc->best_load = cpu_weight_load(cpu, p);
+  sc->best = cpu;
+  sc->sampled = 0;
+  if (sc->best_load == 0)
+    return cpu;
+
+  u32 my_llc = cpu_llc_id(cpu);
+  u32 nr_cpu_ids = scx_bpf_nr_cpu_ids();
+  u32 start = bpf_get_prandom_u32() % nr_cpu_ids;
+  u32 budget = scan_whole_llc ? nr_cpu_ids : BALANCE_SAMPLES;
+  u32 i;
+
+  bpf_for(i, 0, nr_cpu_ids)
+  {
+    u32 other = (start + i) % nr_cpu_ids;
+    if (other == cpu || cpu_llc_id(other) != my_llc || !cpu_is_online(other))
+      continue;
+    if (!bpf_cpumask_test_cpu(other, p->cpus_ptr))
+      continue;
+
+    u64 load = cpu_weight_load(other, p);
+    if (load + margin < sc->best_load)
+    {
+      sc->best_load = load;
+      sc->best = other;
+    }
+    sc->sampled++;
+    if (sc->sampled >= budget)
+      break;
+  }
+
+  s32 best = sc->best;
+  if ((u32)best != cpu)
+    tctx->last_migrated_at = now;
+  return best;
+}
+
+static __always_inline s32 pick_enqueue_cpu(struct task_struct* p, struct task_ctx* tctx, u64 deadline, u64 slack, u32 cpu, u64 now, bool wakeup)
+{
+  u64 best_load = cpu_load_ahead(cpu, deadline, wakeup);
   if (best_load == 0)
   {
     // Claim the cpu if it is idle, so no select_cpu() of another wakeup picks
@@ -64,7 +199,7 @@ static __always_inline s32 pick_enqueue_cpu(struct task_struct* p, struct task_c
 
   // The rate limit for moving tasks doesn't apply when the own cpu is taken by
   // an RT task: the task would wait until that one is done.
-  bool scan_whole_llc = band <= BAND_SCAN_WHOLE_LLC;
+  bool scan_whole_llc = slack <= SCAN_WHOLE_LLC_SLACK_NS;
   if (!scan_whole_llc && now - tctx->last_migrated_at < BALANCE_INTERVAL_NS && !cpu_taken_by_rt(cpu))
     return cpu;
 
@@ -91,7 +226,7 @@ static __always_inline s32 pick_enqueue_cpu(struct task_struct* p, struct task_c
     if (!bpf_cpumask_test_cpu(other, p->cpus_ptr))
       continue;
 
-    u64 load = cpu_load_ahead(other, band);
+    u64 load = cpu_load_ahead(other, deadline, wakeup);
     if (load < sc->best_load)
     {
       sc->best_load = load;
@@ -114,8 +249,65 @@ static __always_inline s32 pick_enqueue_cpu(struct task_struct* p, struct task_c
 // Dispatch
 // ---------------------------------------------------------------------------
 
-static __always_inline bool try_acquire_task_from_other_cpu(u64 band, u32 cpu, bool sameLLC, u64 now)
+// A task of another cpu's queue that @cpu may take: allowed to run on it and not
+// pinned to its cpu for the moment (migrate_disable()).
+static __always_inline bool can_take(struct task_struct* p, u32 cpu)
 {
+  return !p->migration_disabled && bpf_cpumask_test_cpu(cpu, p->cpus_ptr);
+}
+
+// Deadline of the first task in @dsq that @cpu may take (the queue is ordered by
+// deadline, so the earliest of them), DEADLINE_NONE if there is none among the
+// first STEAL_SCAN_DEPTH tasks.
+static __always_inline u64 dsq_first_takeable(u64 dsq, u32 cpu)
+{
+  struct task_struct* p;
+  u32 looked = 0;
+
+  bpf_for_each(scx_dsq, p, dsq, 0)
+  {
+    if (can_take(p, cpu))
+      return task_deadline(p);
+    if (++looked >= STEAL_SCAN_DEPTH)
+      break;
+  }
+  return DEADLINE_NONE;
+}
+
+// Move the first task in @dsq that @cpu may take to the local DSQ of @cpu.
+static __always_inline bool take_first_takeable(u64 dsq, u32 cpu)
+{
+  struct task_struct* p;
+  u32 looked = 0;
+
+  bpf_for_each(scx_dsq, p, dsq, 0)
+  {
+    if (can_take(p, cpu))
+      return scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, SCX_DSQ_LOCAL, 0);
+    if (++looked >= STEAL_SCAN_DEPTH)
+      break;
+  }
+  return false;
+}
+
+#define SCAN_RT_CPUS 0       // cpus of the own llc taken by an RT task
+#define SCAN_OWN_LLC 1       // all other cpus of the own llc
+#define SCAN_OTHER_LLCS 2    // cpus of other llcs
+
+// The cpu (of the cpus selected by @mode) whose queue has the task with the
+// earliest deadline that @cpu may take, -1 if there is none. Its deadline is
+// stored in @deadline. The scan starts at a random cpu, so of several tasks with
+// the same deadline a random one is taken.
+static __always_inline s32 find_earliest(u32 cpu, u32 mode, u64* deadline)
+{
+  u32 key = 0;
+  struct steal_scratch* sc = bpf_map_lookup_elem(&steal_scratch_map, &key);
+  if (!sc)
+    return -1;
+
+  sc->best_deadline = DEADLINE_NONE;
+  sc->best_cpu = -1;
+
   u32 my_llc = cpu_llc_id(cpu);
   u32 nr_cpu_ids = scx_bpf_nr_cpu_ids();
   u32 start = bpf_get_prandom_u32() % nr_cpu_ids;
@@ -126,434 +318,137 @@ static __always_inline bool try_acquire_task_from_other_cpu(u64 band, u32 cpu, b
     u32 other = (start + i) % nr_cpu_ids;
     if (other == cpu || !cpu_is_online(other))
       continue;
-    if (sameLLC && cpu_llc_id(other) != my_llc)
-      continue;
-    if (!sameLLC && cpu_llc_id(other) == my_llc)
+
+    bool same_llc = cpu_llc_id(other) == my_llc;
+    if (mode == SCAN_OTHER_LLCS ? same_llc : !same_llc)
       continue;
 
-    u64 dsq = band_dsq(band, other);
-
-    if (dsq_queued(dsq) && scx_bpf_dsq_move_to_local(dsq, 0))
+    if (mode == SCAN_RT_CPUS)
     {
-      struct dispatch_ctx* victim = get_dispatch_ctx(other);
-      if (victim)
-        stamp_band_head_ts(victim, band, now);
-      return true;
+      struct dispatch_ctx* other_ctx = get_dispatch_ctx(other);
+      if (!other_ctx || !other_ctx->rt_busy || !cpu_taken_by_rt(other))
+        continue;
     }
+
+    u64 dsq = cpu_dsq(other);
+    if (!dsq_queued(dsq))
+      continue;
+
+    u64 d = dsq_first_takeable(dsq, cpu);
+    if (d < sc->best_deadline)
+    {
+      sc->best_deadline = d;
+      sc->best_cpu = other;
+    }
+  }
+
+  *deadline = sc->best_deadline;
+  return sc->best_cpu;
+}
+
+// Run a task of the own queue that is more than STARVE_GRACE_NS past its
+// deadline (see there), checked at most every STARVE_CHECK_INTERVAL_NS.
+static __always_inline bool take_overdue(struct dispatch_ctx* dctx, u64 dsq, u64 now)
+{
+  if (!dctx || now - dctx->last_starve_check < STARVE_CHECK_INTERVAL_NS)
+    return false;
+  dctx->last_starve_check = now;
+
+  struct task_struct* p;
+  u32 looked = 0;
+
+  bpf_for_each(scx_dsq, p, dsq, 0)
+  {
+    u64 deadline = task_deadline(p);
+    if (deadline != DEADLINE_NONE && deadline + STARVE_GRACE_NS < now)
+      return scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, SCX_DSQ_LOCAL, 0);
+    if (++looked >= STARVE_SCAN_DEPTH)
+      break;
   }
   return false;
 }
 
-// How long the first task of @dsq has been waiting, 0 if it is empty.
-static __always_inline u64 dsq_head_wait(u64 dsq, u64 now)
+// Pick the next task for @cpu. @prev_key and @prev_deadline are what prev would
+// run with for another slice (DEADLINE_NONE: no prev that could continue).
+// Returns true when prev keeps running.
+//
+// 1. A task waiting on a cpu of the llc that is taken by an RT task, if its
+//    deadline is earlier than the own next task (or there is none). That cpu
+//    can't run it until the RT task is done, so it loses nothing by moving.
+// 2. A task of the own queue far past its deadline (take_overdue()).
+// 3. The own next task (prev or the head of the own queue, by key).
+// 4. The task with the earliest deadline on the other cpus of the llc.
+// 5. The task with the earliest deadline on cpus of other llcs.
+//
+// Busy cpus don't take tasks from each other, so tasks stay on their cpu (and
+// its caches). Tasks that keep running are balanced when they are queued again
+// after their slice (pick_enqueue_cpu()).
+static __always_inline bool dispatch_dsq_per_cpu(u32 cpu, u64 prev_key, u64 prev_deadline)
 {
-  struct task_struct* p;
-  u64 wait = 0;
+  u64 own_dsq = cpu_dsq(cpu);
+  u64 own_key = dsq_head_key(own_dsq);
+  u64 deadline;
+  s32 other;
 
-  bpf_for_each(scx_dsq, p, dsq, 0)
+  if (nr_rt_busy)
   {
-    struct task_ctx* tctx = get_task_ctx(p);
-    if (tctx)
-      wait = elapsed(now, tctx->queued_at);
-    break;
-  }
-  return wait;
-}
-
-// Take a task of @band from a cpu of the LLC that is taken by an RT or deadline
-// task right now: that cpu can't run it until the RT task is done. Only bands
-// this cpu may serve next (@local_best, BAND_AMOUNT when it has nothing queued)
-// are taken: a band that is worse than what this cpu runs is left alone.
-// A task is taken when it has waited longer than the first task of @band here
-// (and at least RT_STEAL_MIN_WAIT_NS), the one that waited longest. The scan only
-// runs while an RT task runs somewhere (nr_rt_busy).
-static __always_inline bool try_acquire_from_rt_cpu(u64 band, u32 cpu, u64 local_best, u64 now)
-{
-  if (!nr_rt_busy || band > local_best)
-    return false;
-
-  u32 my_llc = cpu_llc_id(cpu);
-  u32 nr_cpu_ids = scx_bpf_nr_cpu_ids();
-  u32 i;
-
-  // The own head is only looked at once there is a candidate at all.
-  bool have_own = false;
-  u64 best_wait = 0;
-  s32 best = -1;
-
-  bpf_for(i, 0, nr_cpu_ids)
-  {
-    if (i == cpu || !cpu_is_online(i) || cpu_llc_id(i) != my_llc)
-      continue;
-
-    struct dispatch_ctx* other = get_dispatch_ctx(i);
-    if (!other || !other->rt_busy)
-      continue;
-
-    u64 dsq = band_dsq(band, i);
-    if (!dsq_queued(dsq) || !cpu_taken_by_rt(i))
-      continue;
-
-    if (!have_own)
-    {
-      u64 own_wait = dsq_head_wait(band_dsq(band, cpu), now);
-      best_wait = own_wait > RT_STEAL_MIN_WAIT_NS ? own_wait : RT_STEAL_MIN_WAIT_NS;
-      have_own = true;
-    }
-
-    u64 wait = dsq_head_wait(dsq, now);
-    if (wait > best_wait)
-    {
-      best_wait = wait;
-      best = i;
-    }
+    u64 own_deadline = dsq_head_deadline(own_dsq);
+    u64 local_best = own_deadline < prev_deadline ? own_deadline : prev_deadline;
+    other = find_earliest(cpu, SCAN_RT_CPUS, &deadline);
+    if (other >= 0 && deadline < local_best && take_first_takeable(cpu_dsq((u32)other), cpu))
+      return false;
   }
 
-  if (best < 0 || !scx_bpf_dsq_move_to_local(band_dsq(band, (u32)best), 0))
+  if (take_overdue(get_dispatch_ctx(cpu), own_dsq, bpf_ktime_get_ns()))
     return false;
 
-  struct dispatch_ctx* victim = get_dispatch_ctx((u32)best);
-  if (victim)
-    stamp_band_head_ts(victim, band, now);
-  return true;
+  if (prev_key != DEADLINE_NONE && prev_key <= own_key)
+    return true;
+  if (own_key != DEADLINE_NONE && scx_bpf_dsq_move_to_local(own_dsq, 0))
+    return false;
+  if (prev_key != DEADLINE_NONE)
+    return true;
+
+  other = find_earliest(cpu, SCAN_OWN_LLC, &deadline);
+  if (other >= 0 && take_first_takeable(cpu_dsq((u32)other), cpu))
+    return false;
+
+  if (nr_llcs > 1)
+  {
+    other = find_earliest(cpu, SCAN_OTHER_LLCS, &deadline);
+    if (other >= 0 && take_first_takeable(cpu_dsq((u32)other), cpu))
+      return false;
+  }
+
+  return false;
 }
 
 // An RT or deadline task took @cpu: the tasks already picked for it (its local
 // DSQ) go back through enqueue(), which sees the cpu as busy and places them on
-// another one. Tasks waiting in its band queues stay: other cpus take them over
-// in dispatch (try_acquire_from_rt_cpu) when they can run them.
+// another one. Tasks waiting in its queue stay: other cpus take them over in
+// dispatch when they are earlier than their own.
 static __always_inline void evacuate_rt_cpu(u32 cpu)
 {
   if (dsq_queued(SCX_DSQ_LOCAL_ON | cpu))
     scx_bpf_reenqueue_local_from_anywhere();
 }
 
-static __always_inline s64 band_overrun(struct dispatch_ctx* dctx, u64 band, u32 cpu, u64 now, u64 budget)
-{
-  if (band >= BAND_AMOUNT || !dsq_queued(band_dsq(band, cpu)))
-    return 0;
-  return (s64)(now - dctx->band_head_ts[band]) - (s64)budget;
-}
-
-static __always_inline u64 most_starved_band(struct dispatch_ctx* dctx, u32 cpu, u64 now)
-{
-  if (now - dctx->last_override_ts < STARVE_OVERRIDE_COOLDOWN_NS)
-    return BAND_AMOUNT;
-
-  u64 worst_band = BAND_AMOUNT;
-  s64 worst_overrun = 0;
-  s64 overrun;
-
-  overrun = band_overrun(dctx, BAND_1, cpu, now, STARVE_BUDGET_BAND_1_NS);
-  if (overrun > worst_overrun)
-  {
-    worst_overrun = overrun;
-    worst_band = BAND_1;
-  }
-
-  overrun = band_overrun(dctx, BAND_2, cpu, now, STARVE_BUDGET_BAND_2_NS);
-  if (overrun > worst_overrun)
-  {
-    worst_overrun = overrun;
-    worst_band = BAND_2;
-  }
-
-  overrun = band_overrun(dctx, BAND_3, cpu, now, STARVE_BUDGET_BAND_3_NS);
-  if (overrun > worst_overrun)
-  {
-    worst_overrun = overrun;
-    worst_band = BAND_3;
-  }
-
-  overrun = band_overrun(dctx, BAND_4, cpu, now, STARVE_BUDGET_BAND_4_NS);
-  if (overrun > worst_overrun)
-  {
-    worst_overrun = overrun;
-    worst_band = BAND_4;
-  }
-
-  return worst_band;
-}
-
-// Tasks waiting on a cpu taken by an RT or deadline task don't run there until
-// the RT task is done. The other cpus only take them over for their own best
-// band (try_acquire_from_rt_cpu) or when they have nothing else to run, so a
-// task of a lower band can wait there as long as the RT task runs. On kernels
-// without the sched_ext deadline server (6.18, 6.19) that is unbounded, and the
-// sched_ext watchdog ejects the scheduler after 30s.
-// So once the head of a band on such a cpu has waited longer than its starvation
-// budget, it is taken over here (the band that overran its budget the most, over
-// all cpus taken by an RT task). Checked at most every RT_RESCUE_INTERVAL_NS per
-// cpu, cpus of the own LLC are preferred.
-static __always_inline bool rescue_starved_from_rt_cpu(struct dispatch_ctx* dctx, u32 cpu, u64 now)
-{
-  if (!nr_rt_busy || now - dctx->last_rt_rescue_ts < RT_RESCUE_INTERVAL_NS)
-    return false;
-  dctx->last_rt_rescue_ts = now;
-
-  u32 key = 0;
-  struct rescue_scratch* sc = bpf_map_lookup_elem(&rescue_scratch_map, &key);
-  if (!sc)
-    return false;
-
-  sc->worst_overrun = 0;
-  sc->worst_band = BAND_AMOUNT;
-  sc->worst_cpu = -1;
-  sc->worst_same_llc = 0;
-
-  u32 my_llc = cpu_llc_id(cpu);
-  u32 nr_cpu_ids = scx_bpf_nr_cpu_ids();
-  u32 i;
-
-  bpf_for(i, 0, nr_cpu_ids)
-  {
-    if (i == cpu || !cpu_is_online(i) || !cpu_taken_by_rt(i))
-      continue;
-    struct dispatch_ctx* victim = get_dispatch_ctx(i);
-    if (!victim)
-      continue;
-
-    u32 same_llc = cpu_llc_id(i) == my_llc;
-    // A candidate of the own LLC is never replaced by one of another LLC.
-    if (sc->worst_same_llc && !same_llc)
-      continue;
-
-    // The band of this cpu that overran its budget the most.
-    // (Written out per band, see dispatch_dsq_per_cpu.)
-    sc->cpu_overrun = 0;
-    sc->cpu_band = BAND_AMOUNT;
-    s64 overrun = band_overrun(victim, BAND_1, i, now, STARVE_BUDGET_BAND_1_NS);
-    if (overrun > sc->cpu_overrun)
-    {
-      sc->cpu_overrun = overrun;
-      sc->cpu_band = BAND_1;
-    }
-    overrun = band_overrun(victim, BAND_2, i, now, STARVE_BUDGET_BAND_2_NS);
-    if (overrun > sc->cpu_overrun)
-    {
-      sc->cpu_overrun = overrun;
-      sc->cpu_band = BAND_2;
-    }
-    overrun = band_overrun(victim, BAND_3, i, now, STARVE_BUDGET_BAND_3_NS);
-    if (overrun > sc->cpu_overrun)
-    {
-      sc->cpu_overrun = overrun;
-      sc->cpu_band = BAND_3;
-    }
-    overrun = band_overrun(victim, BAND_4, i, now, STARVE_BUDGET_BAND_4_NS);
-    if (overrun > sc->cpu_overrun)
-    {
-      sc->cpu_overrun = overrun;
-      sc->cpu_band = BAND_4;
-    }
-    if (sc->cpu_band >= BAND_AMOUNT)
-      continue;
-
-    // The first candidate of the own LLC wins over any of another LLC.
-    if ((same_llc && !sc->worst_same_llc) || sc->cpu_overrun > sc->worst_overrun)
-    {
-      sc->worst_overrun = sc->cpu_overrun;
-      sc->worst_cpu = i;
-      sc->worst_band = sc->cpu_band;
-      sc->worst_same_llc = same_llc;
-    }
-  }
-
-  s32 best = sc->worst_cpu;
-  u64 band = sc->worst_band;
-  if (best < 0 || band >= BAND_AMOUNT)
-    return false;
-  if (!scx_bpf_dsq_move_to_local(band_dsq(band, (u32)best), 0))
-    return false;
-
-  struct dispatch_ctx* victim = get_dispatch_ctx((u32)best);
-  if (victim)
-    stamp_band_head_ts(victim, band, now);
-  return true;
-}
-
-static __always_inline bool take_from_local_band(struct dispatch_ctx* dctx, u64 band, u32 cpu, u64 now)
-{
-  u64 dsq = band_dsq(band, cpu);
-  if (!dsq_queued(dsq) || !scx_bpf_dsq_move_to_local(dsq, 0))
-    return false;
-
-  if (dctx)
-    stamp_band_head_ts(dctx, band, now);
-  return true;
-}
-
-static __always_inline u64 dsq_head_key(u64 dsq)
-{
-  struct task_struct* p;
-  u64 key = (u64)-1;
-
-  bpf_for_each(scx_dsq, p, dsq, 0)
-  {
-    key = p->scx.dsq_vtime;
-    break;
-  }
-  return key;
-}
-
+// Wake an idle cpu for the first task waiting in the queue of @cpu, if it may run
+// elsewhere.
 static __always_inline void kick_idle_for_waiting(u32 cpu)
 {
   struct task_struct* p;
-  u32 band;
 
-  bpf_for(band, 0, BAND_AMOUNT)
+  bpf_for_each(scx_dsq, p, cpu_dsq(cpu), 0)
   {
-    bpf_for_each(scx_dsq, p, band_dsq(band, cpu), 0)
+    if (p->nr_cpus_allowed > 1)
     {
-      if (p->nr_cpus_allowed > 1)
-      {
-        s32 idle = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
-        if (idle >= 0)
-          scx_bpf_kick_cpu(idle, SCX_KICK_IDLE);
-        return;
-      }
-      break;
+      s32 idle = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
+      if (idle >= 0)
+        scx_bpf_kick_cpu(idle, SCX_KICK_IDLE);
     }
+    break;
   }
-}
-
-#define SERVE_CONTINUE 0
-#define SERVE_KEEP_PREV 1
-#define SERVE_TOOK_TASK 2
-
-static __always_inline int serve_local_band(struct dispatch_ctx* dctx, u64 band, u32 cpu, u64 now, u64 prev_band, u64 prev_key)
-{
-  if (prev_band < band)
-    return SERVE_KEEP_PREV;
-
-  u64 dsq = band_dsq(band, cpu);
-  if (prev_band == band && (s64)(prev_key - dsq_head_key(dsq)) <= 0)
-    return SERVE_KEEP_PREV;
-
-  if (take_from_local_band(dctx, band, cpu, now))
-    return SERVE_TOOK_TASK;
-
-  if (prev_band == band)
-    return SERVE_KEEP_PREV;
-  return SERVE_CONTINUE;
-}
-
-static __always_inline bool dispatch_dsq_per_cpu(u32 cpu, u64 prev_band, u64 prev_key)
-{
-  struct dispatch_ctx* dctx = get_dispatch_ctx(cpu);
-  u64 now = bpf_ktime_get_ns();
-  int ret;
-
-  // A starved band goes first, but not on a dispatch caused by a preemption:
-  // the task that preempted must run now, the starved band gets the next one.
-  // It keeps going first until it used its override budget.
-  if (dctx && !dctx->preempt_pending)
-  {
-    if (dctx->override_left)
-    {
-      if (take_from_local_band(dctx, dctx->override_band, cpu, now))
-        return false;
-      dctx->override_left = 0;
-    }
-
-    u64 starved = most_starved_band(dctx, cpu, now);
-    if (starved != BAND_AMOUNT && take_from_local_band(dctx, starved, cpu, now))
-    {
-      dctx->last_override_ts = now;
-      dctx->override_band = starved;
-      dctx->override_left = STARVE_OVERRIDE_BUDGET_NS;
-      return false;
-    }
-
-    // A band that waits beyond its budget on a cpu taken by an RT task.
-    if (rescue_starved_from_rt_cpu(dctx, cpu, now))
-      return false;
-  }
-
-  // Bands are strict across cpus too: a task of a better band than anything
-  // this cpu could run next (prev or its own queues) and waiting on another cpu
-  // of the LLC is taken over first.
-  // (Written out per band: band numbers that come from a loop variable can
-  // lose their range in the verifier and make array accesses fail.)
-  u64 local_best = prev_band < BAND_AMOUNT ? prev_band : BAND_AMOUNT;
-  if (local_best > BAND_0 && dsq_queued(band_dsq(BAND_0, cpu)))
-    local_best = BAND_0;
-  else if (local_best > BAND_1 && dsq_queued(band_dsq(BAND_1, cpu)))
-    local_best = BAND_1;
-  else if (local_best > BAND_2 && dsq_queued(band_dsq(BAND_2, cpu)))
-    local_best = BAND_2;
-  else if (local_best > BAND_3 && dsq_queued(band_dsq(BAND_3, cpu)))
-    local_best = BAND_3;
-  else if (local_best > BAND_4 && dsq_queued(band_dsq(BAND_4, cpu)))
-    local_best = BAND_4;
-
-  // Tasks waiting on a cpu taken by an RT task can't run there, so they are taken
-  // over before the same band of other cpus: the one that waited longest, as long
-  // as it waited longer than this cpu's own head of that band. Bands worse than
-  // local_best are not taken (this cpu runs local_best first).
-  if (try_acquire_from_rt_cpu(BAND_0, cpu, local_best, now))
-    return false;
-  if (local_best > BAND_0 && try_acquire_task_from_other_cpu(BAND_0, cpu, true, now))
-    return false;
-  if (try_acquire_from_rt_cpu(BAND_1, cpu, local_best, now))
-    return false;
-  if (local_best > BAND_1 && try_acquire_task_from_other_cpu(BAND_1, cpu, true, now))
-    return false;
-  if (try_acquire_from_rt_cpu(BAND_2, cpu, local_best, now))
-    return false;
-  if (local_best > BAND_2 && try_acquire_task_from_other_cpu(BAND_2, cpu, true, now))
-    return false;
-  if (try_acquire_from_rt_cpu(BAND_3, cpu, local_best, now))
-    return false;
-  if (local_best > BAND_3 && try_acquire_task_from_other_cpu(BAND_3, cpu, true, now))
-    return false;
-  if (try_acquire_from_rt_cpu(BAND_4, cpu, local_best, now))
-    return false;
-  if (local_best > BAND_4 && try_acquire_task_from_other_cpu(BAND_4, cpu, true, now))
-    return false;
-
-  ret = serve_local_band(dctx, BAND_0, cpu, now, prev_band, prev_key);
-  if (ret != SERVE_CONTINUE)
-    return ret == SERVE_KEEP_PREV;
-  ret = serve_local_band(dctx, BAND_1, cpu, now, prev_band, prev_key);
-  if (ret != SERVE_CONTINUE)
-    return ret == SERVE_KEEP_PREV;
-  ret = serve_local_band(dctx, BAND_2, cpu, now, prev_band, prev_key);
-  if (ret != SERVE_CONTINUE)
-    return ret == SERVE_KEEP_PREV;
-  ret = serve_local_band(dctx, BAND_3, cpu, now, prev_band, prev_key);
-  if (ret != SERVE_CONTINUE)
-    return ret == SERVE_KEEP_PREV;
-  ret = serve_local_band(dctx, BAND_4, cpu, now, prev_band, prev_key);
-  if (ret != SERVE_CONTINUE)
-    return ret == SERVE_KEEP_PREV;
-
-  if (try_acquire_task_from_other_cpu(BAND_0, cpu, true, now))
-    return false;
-  if (try_acquire_task_from_other_cpu(BAND_1, cpu, true, now))
-    return false;
-  if (try_acquire_task_from_other_cpu(BAND_2, cpu, true, now))
-    return false;
-  if (try_acquire_task_from_other_cpu(BAND_3, cpu, true, now))
-    return false;
-  if (try_acquire_task_from_other_cpu(BAND_4, cpu, true, now))
-    return false;
-
-  if (nr_llcs > 1)
-  {
-    if (try_acquire_task_from_other_cpu(BAND_0, cpu, false, now))
-      return false;
-    if (try_acquire_task_from_other_cpu(BAND_1, cpu, false, now))
-      return false;
-    if (try_acquire_task_from_other_cpu(BAND_2, cpu, false, now))
-      return false;
-    if (try_acquire_task_from_other_cpu(BAND_3, cpu, false, now))
-      return false;
-    if (try_acquire_task_from_other_cpu(BAND_4, cpu, false, now))
-      return false;
-  }
-
-  return false;
 }
 
 #endif  // DISPATCHES_H

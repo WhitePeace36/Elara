@@ -10,14 +10,10 @@
 #include "datatypes.h"
 #include "defines.h"
 
-static __always_inline u64 sanitize_band(u64 band)
+// The queue of @cpu: one per cpu, ordered by deadline.
+static __always_inline u64 cpu_dsq(u32 cpu)
 {
-  return band < BAND_AMOUNT ? band : BAND_AMOUNT - 1;
-}
-
-static __always_inline u64 band_dsq(u64 band, u32 cpu)
-{
-  return DSQ_BASE + sanitize_band(band) * DSQ_BAND_STRIDE + cpu;
+  return DSQ_BASE + cpu;
 }
 
 static __always_inline bool is_percpu_kthread(const struct task_struct* p)
@@ -25,67 +21,31 @@ static __always_inline bool is_percpu_kthread(const struct task_struct* p)
   return (p->flags & PF_KTHREAD) && p->nr_cpus_allowed == 1;
 }
 
-static __always_inline u64 task_band(const struct task_struct* p)
+// Slack of a task from its nice value (see SLACK_NICE_0_NS).
+static __always_inline u64 task_slack(const struct task_struct* p)
 {
+  // Per-cpu kernel threads (kworker/N, ksoftirqd/N, ...) are the only ones that
+  // can do the work of their cpu, so they go first, whatever their nice value.
   if (is_percpu_kthread(p))
-    return BAND_0;
+    return SLACK_MIN_NS;
 
-  // SCHED_IDLE asks to run only when nothing else wants the cpu: lowest band,
-  // whatever its nice value.
+  // SCHED_IDLE asks to run only when nothing else wants the cpu.
   if (p->policy == SCHED_IDLE)
-    return BAND_4;
+    return SLACK_MAX_NS;
 
-  int nice = p->static_prio - NICE_0_PRIO;
-
-  if (nice <= BAND_0_MAX_NICE)
-    return BAND_0;
-  if (nice <= BAND_1_MAX_NICE)
-    return BAND_1;
-  if (nice <= BAND_2_MAX_NICE)
-    return BAND_2;
-  if (nice <= BAND_3_MAX_NICE)
-    return BAND_3;
-  return BAND_4;
+  u64 weight = p->scx.weight ? p->scx.weight : 1;
+  u64 slack = SLACK_NICE_0_NS * NICE_0_WEIGHT / weight;
+  if (slack < SLACK_MIN_NS)
+    return SLACK_MIN_NS;
+  if (slack > SLACK_MAX_NS)
+    return SLACK_MAX_NS;
+  return slack;
 }
 
 static __always_inline u64 dsq_queued(u64 dsq)
 {
   s32 n = scx_bpf_dsq_nr_queued(dsq);
   return n > 0 ? (u64)n : 0;
-}
-
-static __always_inline void stamp_band_head_ts(struct dispatch_ctx* dctx, u64 band, u64 now)
-{
-  if (band < BAND_AMOUNT)
-    dctx->band_head_ts[band] = now;
-}
-
-static __always_inline u64 band_reference(struct dispatch_ctx* dctx, u64 band)
-{
-  if (band < BAND_AMOUNT)
-    return dctx->band_vtime[band];
-  return VTIME_BASE;
-}
-
-static __always_inline void advance_band_reference(struct dispatch_ctx* dctx, u64 band, u64 key)
-{
-  if (band < BAND_AMOUNT && (s64)(key - dctx->band_vtime[band]) > 0)
-    dctx->band_vtime[band] = key;
-}
-
-static __always_inline s64 clamp_lag(s64 lag)
-{
-  if (lag > (s64)LAG_MAX_NS)
-    return LAG_MAX_NS;
-  if (lag < -(s64)LAG_MAX_NS)
-    return -(s64)LAG_MAX_NS;
-  return lag;
-}
-
-static __always_inline u64 task_key(struct dispatch_ctx* dctx, u64 band, s64 lag)
-{
-  u64 reference = dctx ? band_reference(dctx, band) : VTIME_BASE;
-  return reference + lag;
 }
 
 static __always_inline struct task_ctx* get_task_ctx(struct task_struct* task)
@@ -139,35 +99,9 @@ static __always_inline u64 elapsed(u64 now, u64 last)
   return now > last ? now - last : 0;
 }
 
-static __always_inline s64 task_lag(struct task_ctx* tctx)
-{
-  if (tctx->key_cpu == KEY_CPU_NONE)
-    return 0;
-  struct dispatch_ctx* from = get_dispatch_ctx(tctx->key_cpu);
-  if (!from)
-    return 0;
-  return clamp_lag((s64)(tctx->key - band_reference(from, tctx->key_band)));
-}
-
-static __always_inline void set_task_key(struct task_ctx* tctx, u64 key, u32 cpu, u64 band)
-{
-  tctx->key = key;
-  tctx->key_cpu = cpu;
-  tctx->key_band = band;
-}
-
-// Time used by a task of the band a starvation override runs for counts
-// against the override budget.
-static __always_inline void charge_override(struct dispatch_ctx* dctx, u64 band, u64 used)
-{
-  if (!dctx->override_left || band != dctx->override_band)
-    return;
-  dctx->override_left = dctx->override_left > used ? dctx->override_left - used : 0;
-}
-
 static __always_inline void charge_wake_boost(struct task_ctx* tctx, u64 used)
 {
-  if (tctx->boost_band == BAND_AMOUNT)
+  if (!tctx->boost_slack)
     return;
   tctx->boost_used += used;
   tctx->boost_credit = tctx->boost_credit > used ? tctx->boost_credit - used : 0;
@@ -190,12 +124,57 @@ static __always_inline void refill_boost_credit(struct task_ctx* tctx, u64 now)
   tctx->boost_credit_ts = now;
 }
 
-static __always_inline u64 effective_band(const struct task_struct* p, struct task_ctx* tctx)
+static __always_inline u64 cpu_vtime_ref(u32 cpu)
 {
-  u64 band = task_band(p);
-  if (tctx && tctx->boost_band < band)
-    return tctx->boost_band;
-  return band;
+  struct dispatch_ctx* dctx = get_dispatch_ctx(cpu);
+  return dctx ? dctx->vtime_ref : VTIME_BASE;
+}
+
+// How far the task is ahead of (positive) or behind (negative) the tasks of its
+// cpu in weighted cpu time, limited to [-LAG_EARLY_MAX_NS, LAG_LATE_MAX_NS].
+static __always_inline s64 task_lag(const struct task_struct* p, struct task_ctx* tctx)
+{
+  if (tctx->vtime_cpu == VTIME_CPU_NONE)
+    return 0;
+  s64 lag = (s64)(tctx->vtime - cpu_vtime_ref(tctx->vtime_cpu));
+  // In vtime, so scaled by weight like the vtime itself: a task with a low
+  // weight uses up much more vtime per slice, and keeps that debt when it moves.
+  u64 weight = p->scx.weight ? p->scx.weight : 1;
+  s64 late_max = (s64)(LAG_LATE_MAX_NS * NICE_0_WEIGHT / weight);
+  if (lag > late_max)
+    return late_max;
+  if (lag < -(s64)LAG_EARLY_MAX_NS)
+    return -(s64)LAG_EARLY_MAX_NS;
+  return lag;
+}
+
+// Move the vtime of a task to @cpu, keeping its lag.
+static __always_inline void rebase_vtime(struct task_ctx* tctx, u32 cpu, s64 lag)
+{
+  tctx->vtime = cpu_vtime_ref(cpu) + lag;
+  tctx->vtime_cpu = cpu;
+}
+
+// Charge @used ns of cpu time to the vtime of a task.
+static __always_inline void charge_vtime(const struct task_struct* p, struct task_ctx* tctx, u64 used)
+{
+  u64 weight = p->scx.weight ? p->scx.weight : 1;
+  tctx->vtime += used * NICE_0_WEIGHT / weight;
+}
+
+// Deadline from the time a task is queued, its slack and its lag.
+static __always_inline u64 make_deadline(u64 now, u64 slack, s64 lag)
+{
+  return now + slack + lag;
+}
+
+// Slack of a task including a wake boost.
+static __always_inline u64 effective_slack(const struct task_struct* p, struct task_ctx* tctx)
+{
+  u64 slack = task_slack(p);
+  if (tctx && tctx->boost_slack && tctx->boost_slack < slack)
+    return tctx->boost_slack;
+  return slack;
 }
 
 #endif  // HELPERS_H
