@@ -47,10 +47,19 @@ struct dispatch_ctx
   u64 vtime_ref;
   // last time this cpu looked for overdue tasks in its queue
   u64 last_starve_check;
+  // when the slice of the running task ends, and when the slice timer fires (0:
+  // not set)
+  u64 slice_end;
+  u64 timer_end;
   bool preempt_pending;
   // this cpu runs an RT or deadline task (as seen by the last sched_switch)
   bool rt_busy;
 };
+
+// Set at the end of elara_init(). The sched_switch tracepoint can run before:
+// the queues don't exist yet then (scx_bpf_dsq_peek() on them stops the
+// scheduler).
+bool elara_ready;
 
 // Number of cpus an RT or deadline task runs on right now. Lets dispatch skip
 // looking for such cpus when there are none.
@@ -95,6 +104,23 @@ struct
   __type(key, u32);
   __type(value, struct dispatch_ctx);
 } dispatch_state SEC(".maps");
+
+// Two timers per cpu: entry cpu ends the slice of the running task on time (see
+// SLICE_NS), entry MAX_CPUS + cpu moves the tasks picked for the cpu elsewhere
+// when an RT task keeps it (see RT_EVACUATE_DELAY_NS). Timers can't be kept in
+// per-cpu maps, so this is an array indexed by cpu.
+struct elara_timer
+{
+  struct bpf_timer timer;
+};
+
+struct
+{
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, 2 * MAX_CPUS);
+  __type(key, u32);
+  __type(value, struct elara_timer);
+} slice_timers SEC(".maps");
 
 struct
 {

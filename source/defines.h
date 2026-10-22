@@ -11,6 +11,15 @@
 #define NS_PER_US 1000ULL
 #define NS_PER_MS (1000ULL * NS_PER_US)
 
+// Slice of a task. A task that can't preempt (a task of the same urgency runs)
+// waits at most this long.
+//
+// The kernel itself only ends a sched_ext slice at the scheduler tick: the slice
+// counts down while the task runs, but the task is only switched out at the
+// first tick after it reached 0. With HZ=1000 a slice of 0.5ms really lasted
+// 0.5-1.5ms, with HZ=250 up to 4.5ms. So a per-cpu timer ends the slice on time
+// when another task waits for the cpu (slice_timer_fn()), and a task queued on a
+// cpu whose running task is already past its slice preempts it right away.
 #define SLICE_NS (1000 * NS_PER_US)
 
 #define RESUME_SLICE_MIN_NS (50 * NS_PER_US)
@@ -19,23 +28,23 @@
 // Deadlines
 // ---------------------------------------------------------------------------
 
-// Every task has a slack from its nice value (through p->scx.weight, 100 at
-// nice 0): SLACK_NICE_0_NS scaled by NICE_0_WEIGHT / weight. A lower nice value
-// gives a shorter slack, so the task gets on the cpu sooner.
+// Every task has a weight from its nice value (nice_weights.h, NICE_0_WEIGHT at
+// nice 0, a factor of 1.5 per nice step, steeper than CFS) and a slack:
+// SLACK_NICE_0_NS scaled by NICE_0_WEIGHT / weight. A lower nice value gives a
+// shorter slack, so the task gets on the cpu sooner.
 //
 // A queued task has two deadlines:
 // - its key, vtime + slack: the order of its cpu's queue. The vtime is the cpu
 //   time it used scaled by NICE_0_WEIGHT / weight, so tasks that keep running
-//   share a cpu by their weight like with nice under CFS (this is the virtual
-//   deadline of EEVDF).
+//   share a cpu by their weight (this is the virtual deadline of EEVDF).
 // - its deadline, queue time + slack + lag (ns, the same clock on every cpu):
 //   used to compare tasks of different cpus, whose vtimes don't compare. A task
 //   waiting on a cpu that can't run it keeps its deadline while the deadlines of
 //   the tasks on the other cpus move on, so it gets taken over.
 //
-//   nice -20: ~35us   nice -12: ~0.2ms   nice -5: ~1ms   nice 0: 3ms
-//   nice   5: ~9ms    nice  10: ~27ms    nice 19: ~300ms
-#define NICE_0_WEIGHT 100
+//   nice -12: ~23us   nice -5: ~0.4ms   nice 0: 3ms
+//   nice   5: ~23ms   nice 10: ~170ms   nice 15 and higher: 500ms
+#define NICE_0_WEIGHT 1024
 #define SLACK_NICE_0_NS (3ULL * NS_PER_MS)
 #define SLACK_MIN_NS (20ULL * NS_PER_US)
 #define SLACK_MAX_NS (500ULL * NS_PER_MS)
@@ -53,9 +62,10 @@
 // Weighted shares alone can let a task wait very long: a SCHED_IDLE task next to
 // a nice -20 task that keeps running gets a slice every ~50s, and the sched_ext
 // watchdog stops the scheduler after 30s. So the deadline is also a promise:
-// every STARVE_CHECK_INTERVAL_NS a cpu looks at its queue (at most
-// STARVE_SCAN_DEPTH tasks) for a task more than STARVE_GRACE_NS past its
-// deadline, and runs it first. With normal shares this hardly ever happens.
+// every STARVE_CHECK_INTERVAL_NS a cpu looks at its queue (at most the last
+// STARVE_SCAN_DEPTH tasks, where the long waiting ones are) for a task more than
+// STARVE_GRACE_NS past its deadline, and runs it first. With normal shares this
+// hardly ever happens.
 #define STARVE_GRACE_NS (500ULL * NS_PER_MS)
 #define STARVE_CHECK_INTERVAL_NS (10ULL * NS_PER_MS)
 #define STARVE_SCAN_DEPTH 32
@@ -82,7 +92,7 @@
 // lighter than its own cpu by more than half its own weight. A cpu taken by an
 // RT or deadline task counts as RT_CPU_WEIGHT. Of a queue, at most
 // WEIGHT_SCAN_DEPTH tasks are summed up, the rest count as nice 0.
-#define RT_CPU_WEIGHT 20000
+#define RT_CPU_WEIGHT (1ULL << 32)
 #define WEIGHT_SCAN_DEPTH 16
 #define BALANCE_SAMPLES 2
 
@@ -120,6 +130,13 @@
 // Realtime
 // ---------------------------------------------------------------------------
 
+// When an RT or deadline task takes a cpu, the task it preempted (and the ones
+// already picked for the cpu) stay there for this long before they are placed
+// again on other cpus. Most RT tasks (irq threads, audio, the compositor) only
+// run for a moment: the preempted task then just continues, instead of losing
+// its place and being moved for nothing.
+#define RT_EVACUATE_DELAY_NS (250ULL * NS_PER_US)
+
 // Load a cpu taken by an RT or deadline task counts as. More than one task: a
 // task of ours gives the cpu back after at most one slice, an RT task only when
 // it is done.
@@ -134,6 +151,9 @@
 #endif
 #ifndef SCHED_IDLE
 #define SCHED_IDLE 5
+#endif
+#ifndef CLOCK_MONOTONIC
+#define CLOCK_MONOTONIC 1
 #endif
 #ifndef SCHED_DEADLINE
 #define SCHED_DEADLINE 6

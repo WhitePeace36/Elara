@@ -17,6 +17,76 @@ char _license[] SEC("license") = "GPL";
 
 UEI_DEFINE(uei);
 
+// The slice of the task running on cpu @key is over: if another task waits for
+// the cpu, end it now instead of at the next tick.
+static int slice_timer_fn(void* map, u32* key, struct elara_timer* st)
+{
+  u32 cpu = *key;
+  struct dispatch_ctx* dctx = get_dispatch_ctx(cpu);
+  if (!dctx)
+    return 0;
+  dctx->timer_end = 0;
+  if (dctx->running_deadline == DEADLINE_NONE || !dsq_queued(cpu_dsq(cpu)))
+    return 0;
+
+  // The timer was set for an earlier slice, which ended sooner (see
+  // arm_slice_timer()): on to the end of the current one.
+  u64 now = bpf_ktime_get_ns();
+  if (now < dctx->slice_end)
+  {
+    dctx->timer_end = dctx->slice_end;
+    bpf_timer_start(&st->timer, dctx->slice_end - now, BPF_F_TIMER_CPU_PIN);
+    return 0;
+  }
+  scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
+  return 0;
+}
+
+// Make sure the slice timer of @cpu fires at the end of the slice of its running
+// task. Only done when a task waits for the cpu: when the slice starts with a
+// non-empty queue, or when a task is queued behind the running one later.
+//
+// A timer still set for an earlier time (the end of an earlier slice, when tasks
+// switch faster than their slices end) is left alone: it goes on to the end of
+// the current slice when it fires. So it is started at most about once per
+// slice, not for every switch.
+static __always_inline void arm_slice_timer(u32 cpu, struct dispatch_ctx* dctx, u64 now)
+{
+  u64 end = dctx->slice_end;
+  if (dctx->timer_end > now && dctx->timer_end <= end)
+    return;
+  dctx->timer_end = end;
+  u32 key = cpu & (MAX_CPUS - 1);
+  struct elara_timer* st = bpf_map_lookup_elem(&slice_timers, &key);
+  if (!st)
+    return;
+  u64 left = end > now ? end - now : 0;
+  // Pinned when set by the cpu itself: the timer fires there without an IPI.
+  bpf_timer_start(&st->timer, left, cpu == bpf_get_smp_processor_id() ? BPF_F_TIMER_CPU_PIN : 0);
+}
+
+// A new slice of @slice ns starts on @cpu (this cpu).
+static __always_inline void start_slice(u32 cpu, struct dispatch_ctx* dctx, u64 now, u64 slice)
+{
+  dctx->slice_end = now + slice;
+  if (dsq_queued(cpu_dsq(cpu)))
+    arm_slice_timer(cpu, dctx, now);
+}
+
+// An RT or deadline task has kept cpu @key - MAX_CPUS for RT_EVACUATE_DELAY_NS:
+// the tasks picked for it go back through enqueue(), which places them on
+// other cpus.
+static int rt_timer_fn(void* map, u32* key, struct elara_timer* st)
+{
+  u32 cpu = *key - MAX_CPUS;
+  struct dispatch_ctx* dctx = get_dispatch_ctx(cpu);
+  if (!dctx || !dctx->rt_busy || cpu != bpf_get_smp_processor_id())
+    return 0;
+  if (dsq_queued(SCX_DSQ_LOCAL_ON | cpu))
+    scx_bpf_reenqueue_local_from_anywhere();
+  return 0;
+}
+
 // callbacks
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(elara_init)
@@ -46,7 +116,31 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(elara_init)
     dispatch_ctx->running_key = DEADLINE_NONE;
     dispatch_ctx->vtime_ref = VTIME_BASE;
     dispatch_ctx->last_starve_check = 0;
+    dispatch_ctx->slice_end = 0;
+    dispatch_ctx->timer_end = 0;
     dispatch_ctx->preempt_pending = false;
+
+    u32 key = cpu & (MAX_CPUS - 1);
+    struct elara_timer* st = bpf_map_lookup_elem(&slice_timers, &key);
+    if (!st)
+      return -ENOMEM;
+    ret = bpf_timer_init(&st->timer, &slice_timers, CLOCK_MONOTONIC);
+    if (ret)
+      return ret;
+    ret = bpf_timer_set_callback(&st->timer, slice_timer_fn);
+    if (ret)
+      return ret;
+
+    key = (cpu & (MAX_CPUS - 1)) + MAX_CPUS;
+    st = bpf_map_lookup_elem(&slice_timers, &key);
+    if (!st)
+      return -ENOMEM;
+    ret = bpf_timer_init(&st->timer, &slice_timers, CLOCK_MONOTONIC);
+    if (ret)
+      return ret;
+    ret = bpf_timer_set_callback(&st->timer, rt_timer_fn);
+    if (ret)
+      return ret;
 
     // scx_bpf_cpu_curr() needs an RCU read section, which a sleepable callback
     // doesn't have by itself.
@@ -57,6 +151,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(elara_init)
       __sync_fetch_and_add(&nr_rt_busy, 1);
   }
 
+  elara_ready = true;
   return 0;
 }
 
@@ -206,24 +301,47 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
   set_queue_keys(tctx, target, now, slack, lag);
   if (reenq)
     tctx->deadline = deadline;
-  scx_bpf_dsq_insert_vtime(p, cpu_dsq(target), SLICE_NS, tctx->key, enq_flags);
 
   struct dispatch_ctx* dctx = get_dispatch_ctx(target);
-  if (!dctx || dctx->running_deadline == DEADLINE_NONE)
+  bool running_ours = dctx && dctx->running_deadline != DEADLINE_NONE;
+
+  // Keys of the same cpu compare: a woken task preempts the running task when
+  // it is clearly earlier. If it is also the earliest of the queue, it goes
+  // straight to the local DSQ with SCX_ENQ_PREEMPT: the running task is
+  // preempted right away. A kick (SCX_KICK_PREEMPT) only takes effect through
+  // irq_work, which on the test VM cost a woken task ~1.5ms more than EEVDF.
+  bool preempt = (enq_flags & SCX_ENQ_WAKEUP) && running_ours && tctx->key + PREEMPT_MARGIN_NS < dctx->running_key;
+  if (preempt && tctx->key <= dsq_head_key(cpu_dsq(target)))
+  {
+    dctx->preempt_pending = true;
+    scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | target, SLICE_NS, enq_flags | SCX_ENQ_PREEMPT);
+    return;
+  }
+
+  scx_bpf_dsq_insert_vtime(p, cpu_dsq(target), SLICE_NS, tctx->key, enq_flags);
+
+  if (!running_ours)
   {
     scx_bpf_kick_cpu(target, SCX_KICK_IDLE);
     return;
   }
 
-  // Keys of the same cpu compare: preempt the running task when the woken one is
-  // clearly earlier.
-  if ((enq_flags & SCX_ENQ_WAKEUP) && tctx->key + PREEMPT_MARGIN_NS < dctx->running_key)
+  // A task of the queue is even earlier: let dispatch pick.
+  if (preempt)
   {
     dctx->preempt_pending = true;
     scx_bpf_kick_cpu(target, SCX_KICK_PREEMPT);
     return;
   }
 
+  // The running task is past its slice (nothing waited when its slice timer
+  // fired): end it now, not at the next tick. Otherwise end it on time.
+  if (now >= dctx->slice_end)
+  {
+    scx_bpf_kick_cpu(target, SCX_KICK_PREEMPT);
+    return;
+  }
+  arm_slice_timer(target, dctx, now);
   scx_bpf_kick_cpu(target, SCX_KICK_IDLE);
 }
 
@@ -287,6 +405,7 @@ void BPF_STRUCT_OPS(elara_dispatch, s32 cpu, struct task_struct* prev)
   pctx->deadline = prev_deadline;
   scx_bpf_task_set_slice(prev, SLICE_NS);
   pctx->granted_slice = SLICE_NS;
+  start_slice(cpu, dctx, now, SLICE_NS);
   dctx->running_key = prev_key;
   dctx->running_deadline = prev_deadline;
   dctx->preempt_pending = false;
@@ -321,6 +440,7 @@ void BPF_STRUCT_OPS(elara_running, struct task_struct* p)
   context->started_at = bpf_ktime_get_ns();
   context->granted_slice = p->scx.slice;
   context->resume_slice = 0;
+  start_slice(cpu, dispatch_ctx, context->started_at, p->scx.slice);
 
   kick_idle_for_waiting(cpu);
 }
@@ -370,13 +490,17 @@ void BPF_STRUCT_OPS(elara_quiescent, struct task_struct* p, u64 deq_flags)
 }
 
 // Every context switch: when the next task is an RT or deadline task, the cpu
-// is taken from us, from one of our tasks or from idle. The tasks already picked
-// for it are placed again, and an idle cpu is woken for the first one still
-// waiting in its queue.
+// is taken from us, from one of our tasks or from idle. If it keeps the cpu for
+// RT_EVACUATE_DELAY_NS, the tasks already picked for it (the preempted one goes
+// back to the front of them) are placed again. An idle cpu is woken right away
+// for the first task waiting in its queue.
 // (This replaces ops.cpu_release, which newer kernels deprecate.)
 SEC("tp_btf/sched_switch")
 int BPF_PROG(elara_sched_switch, bool preempt, struct task_struct* prev, struct task_struct* next, unsigned int prev_state)
 {
+  if (!elara_ready)
+    return 0;
+
   u32 cpu = bpf_get_smp_processor_id();
   struct dispatch_ctx* dctx = get_dispatch_ctx(cpu);
 
@@ -392,7 +516,13 @@ int BPF_PROG(elara_sched_switch, bool preempt, struct task_struct* prev, struct 
   if (!rt)
     return 0;
 
-  evacuate_rt_cpu(cpu);
+  if (dsq_queued(SCX_DSQ_LOCAL_ON | cpu))
+  {
+    u32 key = (cpu & (MAX_CPUS - 1)) + MAX_CPUS;
+    struct elara_timer* st = bpf_map_lookup_elem(&slice_timers, &key);
+    if (st)
+      bpf_timer_start(&st->timer, RT_EVACUATE_DELAY_NS, BPF_F_TIMER_CPU_PIN);
+  }
   kick_idle_for_waiting(cpu);
   return 0;
 }

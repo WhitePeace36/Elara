@@ -9,6 +9,7 @@
 #define HELPERS_H
 #include "datatypes.h"
 #include "defines.h"
+#include "nice_weights.h"
 
 // The queue of @cpu: one per cpu, ordered by deadline.
 static __always_inline u64 cpu_dsq(u32 cpu)
@@ -19,6 +20,20 @@ static __always_inline u64 cpu_dsq(u32 cpu)
 static __always_inline bool is_percpu_kthread(const struct task_struct* p)
 {
   return (p->flags & PF_KTHREAD) && p->nr_cpus_allowed == 1;
+}
+
+// Weight of a task from its nice value (nice_weights.h). SCHED_IDLE asks to run
+// only when nothing else wants the cpu: the lowest weight.
+static __always_inline u64 task_weight(const struct task_struct* p)
+{
+  if (p->policy == SCHED_IDLE)
+    return 1;
+  s32 idx = (s32)p->static_prio - NICE_0_PRIO + 20;
+  if (idx < 0)
+    idx = 0;
+  if (idx > 39)
+    idx = 39;
+  return nice_weights[idx];
 }
 
 // Slack of a task from its nice value (see SLACK_NICE_0_NS).
@@ -33,13 +48,29 @@ static __always_inline u64 task_slack(const struct task_struct* p)
   if (p->policy == SCHED_IDLE)
     return SLACK_MAX_NS;
 
-  u64 weight = p->scx.weight ? p->scx.weight : 1;
-  u64 slack = SLACK_NICE_0_NS * NICE_0_WEIGHT / weight;
+  u64 slack = SLACK_NICE_0_NS * NICE_0_WEIGHT / task_weight(p);
   if (slack < SLACK_MIN_NS)
     return SLACK_MIN_NS;
   if (slack > SLACK_MAX_NS)
     return SLACK_MAX_NS;
   return slack;
+}
+
+// First task of one of our queues. scx_bpf_dsq_peek() (since 6.19) reads it
+// without the lock of the queue, the iterator takes that lock (also of queues of
+// other cpus) for every step. Our queues are all ordered by vtime: peek is right
+// for them since 6.19 (the fix in 7.1 is for FIFO queues).
+static __always_inline struct task_struct* dsq_first(u64 dsq)
+{
+  struct task_struct* p = NULL;
+  struct bpf_iter_scx_dsq it;
+
+  if (bpf_ksym_exists(scx_bpf_dsq_peek))
+    return scx_bpf_dsq_peek(dsq);
+  if (!bpf_iter_scx_dsq_new(&it, dsq, 0))
+    p = bpf_iter_scx_dsq_next(&it);
+  bpf_iter_scx_dsq_destroy(&it);
+  return p;
 }
 
 static __always_inline u64 dsq_queued(u64 dsq)
@@ -139,8 +170,7 @@ static __always_inline s64 task_lag(const struct task_struct* p, struct task_ctx
   s64 lag = (s64)(tctx->vtime - cpu_vtime_ref(tctx->vtime_cpu));
   // In vtime, so scaled by weight like the vtime itself: a task with a low
   // weight uses up much more vtime per slice, and keeps that debt when it moves.
-  u64 weight = p->scx.weight ? p->scx.weight : 1;
-  s64 late_max = (s64)(LAG_LATE_MAX_NS * NICE_0_WEIGHT / weight);
+  s64 late_max = (s64)(LAG_LATE_MAX_NS * NICE_0_WEIGHT / task_weight(p));
   if (lag > late_max)
     return late_max;
   if (lag < -(s64)LAG_EARLY_MAX_NS)
@@ -158,13 +188,17 @@ static __always_inline void rebase_vtime(struct task_ctx* tctx, u32 cpu, s64 lag
 // Charge @used ns of cpu time to the vtime of a task.
 static __always_inline void charge_vtime(const struct task_struct* p, struct task_ctx* tctx, u64 used)
 {
-  u64 weight = p->scx.weight ? p->scx.weight : 1;
-  tctx->vtime += used * NICE_0_WEIGHT / weight;
+  tctx->vtime += used * NICE_0_WEIGHT / task_weight(p);
 }
 
-// Deadline from the time a task is queued, its slack and its lag.
+// Deadline from the time a task is queued, its slack and its lag. The lag goes
+// in at most LAG_LATE_MAX_NS: it is scaled by weight (up to ~20s at nice 19),
+// and the deadline is the promise of take_overdue(), which has to hold well
+// within the 30s of the sched_ext watchdog.
 static __always_inline u64 make_deadline(u64 now, u64 slack, s64 lag)
 {
+  if (lag > (s64)LAG_LATE_MAX_NS)
+    lag = LAG_LATE_MAX_NS;
   return now + slack + lag;
 }
 

@@ -7,8 +7,11 @@ Scx_elara is a multipurpose scheduler which was developed with ananicy in mind.
 
 It is an earliest deadline first scheduler with one queue per cpu: the nice value
 decides both how soon a task gets on the cpu and how much cpu time it gets when it
-keeps running, like with CFS/EEVDF. So the default ananicy profiles fit, and lower nice
-values for audio, the compositor and games make them both faster and bigger.
+keeps running, like with CFS/EEVDF, but with a steeper curve: each nice step is a factor
+of 1.5 instead of ~1.25. So a game at nice -5 gets ~88% of a core against a nice 0 task
+(CFS: 75%), and the usual levels (audio and compositor at -12, games at -5, normal tasks
+at 0, background work at 5 and higher) are well apart without ever locking anything
+out.
 
 ## Dependencies
 
@@ -65,17 +68,25 @@ sudo ./uninstall.sh
 
 ### Slack, weight and deadlines
 
-Every task has a weight from its nice value (`p->scx.weight`, 100 at nice 0, the same
-table as CFS) and a slack: `SLACK_NICE_0_NS` (3ms) scaled by 100 / weight.
+Every task has a weight from its nice value (`source/nice_weights.h`, 1024 at nice 0, a
+factor of 1.5 per nice step) and a slack: `SLACK_NICE_0_NS` (3ms) scaled by
+1024 / weight, limited to 20us .. 500ms.
 
-| Nice | Slack | Cpu share against a nice 0 task on one core |
-| ---- | ----- | ------------------------------------------- |
-| -20 | ~35us | ~99% |
-| -12 | ~0.2ms | ~94% |
-| -5 | ~1ms | ~75% |
-| 0 | 3ms | 50% |
-| 5 | ~9ms | ~25% |
-| 19 | ~300ms | ~1% |
+| Nice | Weight | Slack | Cpu share against a nice 0 task on one core (CFS) |
+| ---- | ------ | ----- | ------------------------------------------------- |
+| -12 | 132860 | ~23us | ~99% (94%) |
+| -5 | 7776 | ~0.4ms | ~88% (75%) |
+| 0 | 1024 | 3ms | 50% (50%) |
+| 5 | 135 | ~23ms | ~12% (25%) |
+| 10 | 18 | ~170ms | ~2% (9%) |
+| 19 | 1 | 500ms | ~0.1% (1%) |
+
+The factor is steeper than CFS on purpose: with the CFS table a game at nice -5 lost a
+lot of its share as soon as several nice 0 tasks (video decoding, a compile) ran next to
+it, and its frame times got much less even (tests in a VM with a game-like workload,
+network traffic, two livestreams and a compile: frame time spread p1..p99 13-15ms
+instead of 19-20ms). A factor of 2 was worse again: the slack of nice -5 gets so short
+that the threads of the game keep interrupting each other.
 
 Per-cpu kernel threads (kworker/N, ksoftirqd/N, ...) get the shortest slack (20us),
 they are the only ones that can do the work of their cpu. SCHED_IDLE tasks get the
@@ -84,14 +95,14 @@ longest (500ms).
 Each queued task has two deadlines:
 
 - its key, `vtime + slack`: the order of its cpu's queue. The vtime is the cpu time
-  the task used, scaled by 100 / weight, so it advances slower for tasks with a lower
+  the task used, scaled by 1024 / weight, so it advances slower for tasks with a lower
   nice value. Ordering by it makes tasks that keep running share a cpu by their weight
   (this is the virtual deadline of EEVDF).
 - its deadline, `queue time + slack + lag` in ns: it is the same clock on every cpu,
   so it is used whenever tasks of different cpus are compared. The lag is the vtime of
   the task minus the vtime reference of its cpu (the highest vtime that started running
-  there), limited to -1ms (`LAG_EARLY_MAX_NS`, the most a task that slept gets ahead)
-  and +20ms (`LAG_LATE_MAX_NS`) scaled by 100 / weight, so a task with a low weight
+  there), limited to -0.5ms (`LAG_EARLY_MAX_NS`, one slice: the most a task that slept gets ahead)
+  and +20ms (`LAG_LATE_MAX_NS`) scaled by 1024 / weight, so a task with a low weight
   keeps the debt of its last slice when it moves to another cpu.
 
 A woken task gets half its slack (`WAKE_SLACK_DIV`), otherwise it would land behind
@@ -102,13 +113,30 @@ very long (a SCHED_IDLE task next to a nice -20 task that keeps running would ge
 slice every ~50s, and the sched_ext watchdog stops the scheduler after 30s), so the
 deadline is also a promise: every 10ms (`STARVE_CHECK_INTERVAL_NS`) a cpu looks at its
 queue for a task more than 500ms (`STARVE_GRACE_NS`) past its deadline and runs it
-first. With normal shares this hardly ever happens.
+first. It looks from the end of the queue (at most 32 tasks): the tasks that wait
+longest have the latest keys, so with many queued tasks they would be out of reach from
+the front. With normal shares this hardly ever happens.
 
 ## Preemption
 
+Every task runs for slices of 0.5ms (`SLICE_NS`). A task that can't preempt the running
+one (because that one is about as urgent) waits at most that long.
+
+The kernel itself only ends a sched_ext slice at the scheduler tick: the slice counts
+down while the task runs, but the task is only switched out at the first tick after it
+reached 0. With HZ=1000 a slice of 0.5ms really lasted 0.5-1.5ms, with HZ=300 up to
+almost 4ms. So elara ends slices on time itself: when a slice starts while other tasks
+wait for the core, or when a task is queued behind the running one later, a per-core
+timer (`slice_timers`) is set to the end of the slice and preempts the running task
+then. A task queued behind a running task that is already past its slice preempts it
+right away. When nothing waits, no timer is set and the task just keeps running.
+
 A waking task preempts the running task of its cpu when its key is earlier by more than
-250us (`PREEMPT_MARGIN_NS`). The preempted task goes back into its queue with its key,
-deadline and the rest of its slice.
+250us (`PREEMPT_MARGIN_NS`). If it is also the earliest of the queue, it goes straight
+into the local queue of the cpu with `SCX_ENQ_PREEMPT`, so the running task is preempted
+right away. A kick (`SCX_KICK_PREEMPT`) only takes effect through irq_work, which made a
+woken task wait about 1ms longer. The preempted task goes back into its queue with its
+key, deadline and the rest of its slice.
 
 When the slice of a task runs out, its vtime is updated. It keeps running for another
 slice if its new key is not later than the key of the first queued task.
@@ -142,8 +170,8 @@ unless the woken task preempts it, and queued tasks with an earlier deadline).
 
 A task that keeps running and doesn't keep the cpu after its slice is balanced by
 weight instead, like CFS does: it moves to the core with the least weight of other
-tasks (running and queued; a core taken by a realtime task counts as 20000,
-`RT_CPU_WEIGHT`), if that one is lighter than its own core by more than half its own
+tasks (running and queued; a core taken by a realtime task counts as 2^32, heavier than
+any task, `RT_CPU_WEIGHT`), if that one is lighter than its own core by more than half its own
 weight. Counting tasks instead of weight would leave two nice -20 tasks sharing one core
 while a nice 0 task has another core to itself.
 
@@ -167,10 +195,14 @@ all of elara's tasks. A core that runs such a task counts as busy, with a load o
 tasks (`RT_CPU_LOAD`).
 
 Every switch to a realtime or deadline task is seen by a `sched_switch` tracepoint,
-which also keeps count of the cores taken by one (`nr_rt_busy`). The tasks already
-picked to run next on that core then go back through placement, and an idle core is
-woken for the first task waiting in its queue. A preempted task that would resume on a
-core taken by a realtime task goes through placement too.
+which also keeps count of the cores taken by one (`nr_rt_busy`). An idle core is woken
+right away for the first task waiting in the queue of that core. If the realtime task
+keeps the core for 250us (`RT_EVACUATE_DELAY_NS`), the tasks already picked to run next
+on it (the task it preempted is the first of them) go back through placement. Most
+realtime tasks (irq threads, audio, the compositor) are done much sooner: the preempted
+task then just continues, instead of losing its place in the queue and being moved for
+nothing. A preempted task that would resume on a core taken by a realtime task goes
+through placement too.
 
 Tasks waiting in the queue of such a core are taken over by the other cores of its llc
 (see Dispatch): that core can't run them until the realtime task is done, so they lose
@@ -190,7 +222,8 @@ When a core needs its next task:
 
 1. If a core runs a realtime task (`nr_rt_busy`): the earliest task waiting on a core
    of its llc taken by a realtime task, if its deadline is earlier than the core's own
-   next task (or it has none).
+   next task (or it has none). Then the same for cores of other llcs, so a task that may
+   only run on its realtime core and on cores of another llc isn't stuck there.
 2. A task of its own queue more than 500ms past its deadline (see above).
 3. Its own next task: the running task for another slice or the first one of its queue,
    by key.
