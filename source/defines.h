@@ -16,10 +16,10 @@
 //
 // The kernel itself only ends a sched_ext slice at the scheduler tick: the slice
 // counts down while the task runs, but the task is only switched out at the
-// first tick after it reached 0. With HZ=1000 a slice of 0.5ms really lasted
-// 0.5-1.5ms, with HZ=250 up to 4.5ms. So a per-cpu timer ends the slice on time
-// when another task waits for the cpu (slice_timer_fn()), and a task queued on a
-// cpu whose running task is already past its slice preempts it right away.
+// first tick after it reached 0. With HZ=1000 a slice of 1ms really lasted
+// 1-2ms, with HZ=250 up to 5ms. So a per-cpu timer ends the slice on time when
+// another task waits for the cpu (slice_timer_fn()), and a task queued on a cpu
+// whose running task is already past its slice preempts it right away.
 #define SLICE_NS (1000 * NS_PER_US)
 
 #define RESUME_SLICE_MIN_NS (50 * NS_PER_US)

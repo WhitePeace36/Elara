@@ -19,6 +19,13 @@ UEI_DEFINE(uei);
 
 // The slice of the task running on cpu @key is over: if another task waits for
 // the cpu, end it now instead of at the next tick.
+// A task waits for @cpu: one in its queue, or one stuck on a cpu taken by an RT
+// task, which this cpu takes over when its slice ends (see dispatch).
+static __always_inline bool tasks_waiting(u32 cpu)
+{
+  return dsq_queued(cpu_dsq(cpu)) || nr_rt_busy;
+}
+
 static int slice_timer_fn(void* map, u32* key, struct elara_timer* st)
 {
   u32 cpu = *key;
@@ -26,7 +33,7 @@ static int slice_timer_fn(void* map, u32* key, struct elara_timer* st)
   if (!dctx)
     return 0;
   dctx->timer_end = 0;
-  if (dctx->running_deadline == DEADLINE_NONE || !dsq_queued(cpu_dsq(cpu)))
+  if (dctx->running_deadline == DEADLINE_NONE || !tasks_waiting(cpu))
     return 0;
 
   // The timer was set for an earlier slice, which ended sooner (see
@@ -69,7 +76,7 @@ static __always_inline void arm_slice_timer(u32 cpu, struct dispatch_ctx* dctx, 
 static __always_inline void start_slice(u32 cpu, struct dispatch_ctx* dctx, u64 now, u64 slice)
 {
   dctx->slice_end = now + slice;
-  if (dsq_queued(cpu_dsq(cpu)))
+  if (tasks_waiting(cpu))
     arm_slice_timer(cpu, dctx, now);
 }
 
@@ -436,6 +443,11 @@ void BPF_STRUCT_OPS(elara_running, struct task_struct* p)
   dispatch_ctx->running_key = context->key;
   dispatch_ctx->running_deadline = context->deadline;
   dispatch_ctx->preempt_pending = false;
+
+  // Tasks the kernel queues by itself (exiting tasks and tasks with migration
+  // disabled go straight to the local DSQ) come with its default slice of 20ms.
+  if (p->scx.slice > SLICE_NS)
+    scx_bpf_task_set_slice(p, SLICE_NS);
 
   context->started_at = bpf_ktime_get_ns();
   context->granted_slice = p->scx.slice;

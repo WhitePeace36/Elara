@@ -101,7 +101,7 @@ Each queued task has two deadlines:
 - its deadline, `queue time + slack + lag` in ns: it is the same clock on every cpu,
   so it is used whenever tasks of different cpus are compared. The lag is the vtime of
   the task minus the vtime reference of its cpu (the highest vtime that started running
-  there), limited to -0.5ms (`LAG_EARLY_MAX_NS`, one slice: the most a task that slept gets ahead)
+  there), limited to -1ms (`LAG_EARLY_MAX_NS`, one slice: the most a task that slept gets ahead)
   and +20ms (`LAG_LATE_MAX_NS`) scaled by 1024 / weight, so a task with a low weight
   keeps the debt of its last slice when it moves to another cpu.
 
@@ -119,17 +119,23 @@ the front. With normal shares this hardly ever happens.
 
 ## Preemption
 
-Every task runs for slices of 0.5ms (`SLICE_NS`). A task that can't preempt the running
+Every task runs for slices of 1ms (`SLICE_NS`). A task that can't preempt the running
 one (because that one is about as urgent) waits at most that long.
 
 The kernel itself only ends a sched_ext slice at the scheduler tick: the slice counts
 down while the task runs, but the task is only switched out at the first tick after it
-reached 0. With HZ=1000 a slice of 0.5ms really lasted 0.5-1.5ms, with HZ=300 up to
-almost 4ms. So elara ends slices on time itself: when a slice starts while other tasks
+reached 0. With HZ=1000 a slice of 1ms really lasted 1-2ms, with HZ=300 up to
+more than 4ms. So elara ends slices on time itself: when a slice starts while other tasks
 wait for the core, or when a task is queued behind the running one later, a per-core
 timer (`slice_timers`) is set to the end of the slice and preempts the running task
 then. A task queued behind a running task that is already past its slice preempts it
 right away. When nothing waits, no timer is set and the task just keeps running.
+
+While an RT task runs on some core, the timer is set on the other cores too: tasks
+stuck in the queue of the RT core are only taken over when another core's slice ends.
+Tasks the kernel queues by itself, without asking elara (exiting tasks, tasks with
+migration disabled), come with the kernel's default slice of 20ms; it is cut down to
+`SLICE_NS` when they start running.
 
 A waking task preempts the running task of its cpu when its key is earlier by more than
 250us (`PREEMPT_MARGIN_NS`). If it is also the earliest of the queue, it goes straight
