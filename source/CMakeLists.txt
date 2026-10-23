@@ -6,6 +6,7 @@ set(BPF_HEADER
     ${CMAKE_CURRENT_SOURCE_DIR}/datatypes.h
     ${CMAKE_CURRENT_SOURCE_DIR}/helpers.h
     ${CMAKE_CURRENT_SOURCE_DIR}/dispatches.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/nice_weights.h
 )
 
 set(BPF_OBJ
@@ -48,6 +49,7 @@ set(elaraHeader
     defines.h
     dispatches.h
     helpers.h
+    nice_weights.h
     elara_topology.h
 )
 add_custom_command(

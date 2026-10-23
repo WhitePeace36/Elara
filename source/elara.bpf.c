@@ -17,8 +17,6 @@ char _license[] SEC("license") = "GPL";
 
 UEI_DEFINE(uei);
 
-// The slice of the task running on cpu @key is over: if another task waits for
-// the cpu, end it now instead of at the next tick.
 // A task waits for @cpu: one in its queue, or one stuck on a cpu taken by an RT
 // task, which this cpu takes over when its slice ends (see dispatch).
 static __always_inline bool tasks_waiting(u32 cpu)
@@ -26,6 +24,8 @@ static __always_inline bool tasks_waiting(u32 cpu)
   return dsq_queued(cpu_dsq(cpu)) || nr_rt_busy;
 }
 
+// The slice of the task running on cpu @key is over: if another task waits for
+// the cpu, end it now instead of at the next tick.
 static int slice_timer_fn(void* map, u32* key, struct elara_timer* st)
 {
   u32 cpu = *key;

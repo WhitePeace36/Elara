@@ -430,12 +430,12 @@ static __always_inline bool dispatch_dsq_per_cpu(u32 cpu, u64 prev_key, u64 prev
 }
 
 // Wake an idle cpu for the first task waiting in the queue of @cpu, if it may run
-// elsewhere.
+// elsewhere (not pinned to the cpu, also not for the moment by migrate_disable()).
 static __always_inline void kick_idle_for_waiting(u32 cpu)
 {
   struct task_struct* p = dsq_first(cpu_dsq(cpu));
 
-  if (p && p->nr_cpus_allowed > 1)
+  if (p && p->nr_cpus_allowed > 1 && !p->migration_disabled)
   {
     s32 idle = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
     if (idle >= 0)
