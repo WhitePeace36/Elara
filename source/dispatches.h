@@ -81,7 +81,15 @@ static __always_inline u64 cpu_weight_load(u32 cpu, struct task_struct* self)
   if (curr && curr != self && curr->pid)
     load += is_rt_task(curr) ? RT_CPU_WEIGHT : task_weight(curr);
 
-  load += dsq_queued(SCX_DSQ_LOCAL_ON | cpu) * NICE_0_WEIGHT;
+  // The tasks already picked for the cpu count as nice 0, except the one the
+  // own dispatch just picked (see note_local()).
+  u64 nlocal = dsq_queued(SCX_DSQ_LOCAL_ON | cpu);
+  if (nlocal)
+  {
+    struct dispatch_ctx* dctx = get_dispatch_ctx(cpu);
+    u64 lw = dctx && cpu == bpf_get_smp_processor_id() ? dctx->local_weight : 0;
+    load += lw ? lw + (nlocal - 1) * NICE_0_WEIGHT : nlocal * NICE_0_WEIGHT;
+  }
 
   u64 dsq = cpu_dsq(cpu);
   bpf_for_each(scx_dsq, q, dsq, 0)
@@ -274,7 +282,12 @@ static __always_inline bool take_first_takeable(u64 dsq, u32 cpu)
   bpf_for_each(scx_dsq, p, dsq, 0)
   {
     if (can_take(p, cpu))
-      return scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, SCX_DSQ_LOCAL, 0);
+    {
+      if (!scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, SCX_DSQ_LOCAL, 0))
+        return false;
+      note_local(cpu, p);
+      return true;
+    }
     if (++looked >= STEAL_SCAN_DEPTH)
       break;
   }
@@ -357,7 +370,12 @@ static __always_inline bool take_overdue(struct dispatch_ctx* dctx, u64 dsq, u64
   {
     u64 deadline = task_deadline(p);
     if (deadline != DEADLINE_NONE && deadline + STARVE_GRACE_NS < now)
-      return scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, SCX_DSQ_LOCAL, 0);
+    {
+      if (!scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, SCX_DSQ_LOCAL, 0))
+        return false;
+      note_local(bpf_get_smp_processor_id(), p);
+      return true;
+    }
     if (++looked >= STARVE_SCAN_DEPTH)
       break;
   }
@@ -410,8 +428,18 @@ static __always_inline bool dispatch_dsq_per_cpu(u32 cpu, u64 prev_key, u64 prev
 
   if (prev_key != DEADLINE_NONE && prev_key <= own_key)
     return true;
-  if (own_key != DEADLINE_NONE && scx_bpf_dsq_move_to_local(own_dsq, 0))
-    return false;
+  if (own_key != DEADLINE_NONE)
+  {
+    struct task_struct* head = dsq_first(own_dsq);
+    u64 w = head ? task_weight(head) : NICE_0_WEIGHT;
+    if (scx_bpf_dsq_move_to_local(own_dsq, 0))
+    {
+      struct dispatch_ctx* dctx = get_dispatch_ctx(cpu);
+      if (dctx)
+        dctx->local_weight = w;
+      return false;
+    }
+  }
   if (prev_key != DEADLINE_NONE)
     return true;
 

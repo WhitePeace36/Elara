@@ -101,9 +101,12 @@ Each queued task has two deadlines:
 - its deadline, `queue time + slack + lag` in ns: it is the same clock on every cpu,
   so it is used whenever tasks of different cpus are compared. The lag is the vtime of
   the task minus the vtime reference of its cpu (the highest vtime that started running
-  there), limited to -1ms (`LAG_EARLY_MAX_NS`, one slice: the most a task that slept gets ahead)
-  and +20ms (`LAG_LATE_MAX_NS`) scaled by 1024 / weight, so a task with a low weight
-  keeps the debt of its last slice when it moves to another cpu.
+  there), limited to ±20ms (`LAG_LATE_MAX_NS`) scaled by 1024 / weight: a task with a
+  low weight keeps the debt of its last slice when it moves to another cpu, and keeps
+  what it is owed when it had to wait. A task that wakes up is at most 1ms
+  (`LAG_EARLY_MAX_NS`, one slice) behind: sleeping doesn't earn cpu time. (Limiting
+  every task to that made the slacks decide the shares instead of the weights: a nice
+  5 task next to a nice 0 task got 6% instead of 12%.)
 
 A woken task gets half its slack (`WAKE_SLACK_DIV`), otherwise it would land behind
 every task of the same nice value that keeps running.
@@ -159,6 +162,12 @@ most 4ms that refills at 4ms per 20ms (`WAKE_BOOST_WINDOW_NS`), so at most a fif
 core. A boost gets at most what is left of the credit, and with less than 250us left
 (`WAKE_BOOST_MIN_NS`) there is no boost.
 
+While boosted, the cpu time of the task is charged to its vtime with the weight of the
+waker, not its own. Otherwise a light task (a nice 0 audio client woken by a nice -12
+audio server) would use up its turn within its first slice and then wait behind every
+task of a higher weight anyway: under a nice -5 load on every core such a client doing
+1.5ms of work every 5ms missed its deadline 1390 of 1600 times, now 333 (EEVDF: 604).
+
 The waker's own slack counts, not a slack it runs with because it was boosted itself.
 Otherwise a boost would pass on to everything the boosted task wakes, and from there on.
 
@@ -179,7 +188,10 @@ weight instead, like CFS does: it moves to the core with the least weight of oth
 tasks (running and queued; a core taken by a realtime task counts as 2^32, heavier than
 any task, `RT_CPU_WEIGHT`), if that one is lighter than its own core by more than half its own
 weight. Counting tasks instead of weight would leave two nice -20 tasks sharing one core
-while a nice 0 task has another core to itself.
+while a nice 0 task has another core to itself. The task that runs next on the own
+core is already in its local queue at that point, which elara can't look into: its
+weight is remembered when dispatch picks it (counting it as nice 0 kept a light task
+next to a heavy one while another core had only light tasks).
 
 For both:
 

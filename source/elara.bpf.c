@@ -125,6 +125,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(elara_init)
     dispatch_ctx->last_starve_check = 0;
     dispatch_ctx->slice_end = 0;
     dispatch_ctx->timer_end = 0;
+    dispatch_ctx->local_weight = 0;
     dispatch_ctx->preempt_pending = false;
 
     u32 key = cpu & (MAX_CPUS - 1);
@@ -176,6 +177,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(elara_init_task, struct task_struct* p, struct scx_
   tctx->vtime = VTIME_BASE;
   tctx->vtime_cpu = VTIME_CPU_NONE;
   tctx->boost_slack = 0;
+  tctx->boost_weight = 0;
   tctx->boost_used = 0;
   tctx->boost_limit = 0;
   tctx->boost_credit = WAKE_BOOST_BUDGET_NS;
@@ -214,6 +216,7 @@ static __always_inline void apply_wake_boost(struct task_struct* p, struct task_
     return;
 
   tctx->boost_slack = waker_slack;
+  tctx->boost_weight = task_weight(waker);
   tctx->boost_used = 0;
   tctx->boost_limit = tctx->boost_credit < WAKE_BOOST_BUDGET_NS ? tctx->boost_credit : WAKE_BOOST_BUDGET_NS;
 }
@@ -250,7 +253,7 @@ s32 BPF_STRUCT_OPS(elara_select_cpu, struct task_struct* p, s32 prev_cpu, u64 wa
   {
     u64 now = bpf_ktime_get_ns();
     u64 slack = wakeup_slack(p, tctx);
-    s64 lag = task_lag(p, tctx);
+    s64 lag = task_lag(p, tctx, true);
     if (cpu_load_ahead(cpu, make_deadline(now, slack, lag), true) == 0)
     {
       set_queue_keys(tctx, cpu, now, slack, lag);
@@ -292,7 +295,7 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
   }
 
   u64 slack = (enq_flags & SCX_ENQ_WAKEUP) ? wakeup_slack(p, tctx) : effective_slack(p, tctx);
-  s64 lag = task_lag(p, tctx);
+  s64 lag = task_lag(p, tctx, enq_flags & SCX_ENQ_WAKEUP);
   // A re-enqueue (the cpu was taken by an RT task) keeps the deadline: the task
   // has already waited for it.
   bool reenq = enq_flags & SCX_ENQ_REENQ;
@@ -384,7 +387,7 @@ void BPF_STRUCT_OPS(elara_dispatch, s32 cpu, struct task_struct* prev)
       {
         u64 slack = effective_slack(prev, pctx);
         prev_key = pctx->vtime + slack;
-        prev_deadline = make_deadline(now, slack, task_lag(prev, pctx));
+        prev_deadline = make_deadline(now, slack, task_lag(prev, pctx, false));
       }
     }
   }
@@ -399,7 +402,7 @@ void BPF_STRUCT_OPS(elara_dispatch, s32 cpu, struct task_struct* prev)
     pctx->boost_slack = 0;
     u64 slack = task_slack(prev);
     prev_key = pctx->vtime + slack;
-    prev_deadline = make_deadline(now, slack, task_lag(prev, pctx));
+    prev_deadline = make_deadline(now, slack, task_lag(prev, pctx, false));
   }
 
   // The vtime reference follows the running task also when it keeps the cpu:
@@ -434,7 +437,7 @@ void BPF_STRUCT_OPS(elara_running, struct task_struct* p)
   if (context->vtime_cpu != cpu)
   {
     u64 slack = context->key - context->vtime;
-    rebase_vtime(context, cpu, task_lag(p, context));
+    rebase_vtime(context, cpu, task_lag(p, context, false));
     context->key = context->vtime + slack;
   }
   if ((s64)(context->vtime - dispatch_ctx->vtime_ref) > 0)
@@ -443,6 +446,9 @@ void BPF_STRUCT_OPS(elara_running, struct task_struct* p)
   dispatch_ctx->running_key = context->key;
   dispatch_ctx->running_deadline = context->deadline;
   dispatch_ctx->preempt_pending = false;
+
+  // Out of the local DSQ (see note_local()).
+  dispatch_ctx->local_weight = 0;
 
   // Tasks the kernel queues by itself (exiting tasks and tasks with migration
   // disabled go straight to the local DSQ) come with its default slice of 20ms.

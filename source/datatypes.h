@@ -24,6 +24,8 @@ struct task_ctx
   u32 vtime_cpu;
   // slack taken over from the waker by a wake boost (0: no boost)
   u64 boost_slack;
+  // weight of the waker the boost came from (its cpu time is charged with it)
+  u64 boost_weight;
   // cpu time used with the boost since the wakeup that boosted it, and how much
   // of it that boost may use (WAKE_BOOST_BUDGET_NS, less when the credit is low)
   u64 boost_used;
@@ -51,6 +53,9 @@ struct dispatch_ctx
   // not set)
   u64 slice_end;
   u64 timer_end;
+  // weight of the task dispatch just put into the local DSQ of this cpu and
+  // that hasn't started yet (see note_local())
+  u64 local_weight;
   bool preempt_pending;
   // this cpu runs an RT or deadline task (as seen by the last sched_switch)
   bool rt_busy;

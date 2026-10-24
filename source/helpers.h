@@ -162,19 +162,28 @@ static __always_inline u64 cpu_vtime_ref(u32 cpu)
 }
 
 // How far the task is ahead of (positive) or behind (negative) the tasks of its
-// cpu in weighted cpu time, limited to [-LAG_EARLY_MAX_NS, LAG_LATE_MAX_NS].
-static __always_inline s64 task_lag(const struct task_struct* p, struct task_ctx* tctx)
+// cpu in weighted cpu time. Limited to LAG_LATE_MAX_NS either way, scaled by
+// weight like the vtime itself: a task with a low weight uses up much more vtime
+// per slice, keeps that debt when it moves, and is just as far behind when it
+// had to wait.
+//
+// A task that wakes up (@woken) is at most LAG_EARLY_MAX_NS behind: it slept,
+// sleeping doesn't earn cpu time. A task that stayed runnable keeps all of it:
+// it is behind because it waited for the cpu, and that is what makes the shares
+// follow the weights. Clamping it too would let the slack decide instead: a nice
+// 5 task next to a nice 0 task got a slice every ~20ms (the difference of their
+// slacks) instead of every ~7.6ms (the ratio of their weights).
+static __always_inline s64 task_lag(const struct task_struct* p, struct task_ctx* tctx, bool woken)
 {
   if (tctx->vtime_cpu == VTIME_CPU_NONE)
     return 0;
   s64 lag = (s64)(tctx->vtime - cpu_vtime_ref(tctx->vtime_cpu));
-  // In vtime, so scaled by weight like the vtime itself: a task with a low
-  // weight uses up much more vtime per slice, and keeps that debt when it moves.
-  s64 late_max = (s64)(LAG_LATE_MAX_NS * NICE_0_WEIGHT / task_weight(p));
-  if (lag > late_max)
-    return late_max;
-  if (lag < -(s64)LAG_EARLY_MAX_NS)
-    return -(s64)LAG_EARLY_MAX_NS;
+  s64 lag_max = (s64)(LAG_LATE_MAX_NS * NICE_0_WEIGHT / task_weight(p));
+  s64 early_max = woken ? (s64)LAG_EARLY_MAX_NS : lag_max;
+  if (lag > lag_max)
+    return lag_max;
+  if (lag < -early_max)
+    return -early_max;
   return lag;
 }
 
@@ -185,10 +194,18 @@ static __always_inline void rebase_vtime(struct task_ctx* tctx, u32 cpu, s64 lag
   tctx->vtime_cpu = cpu;
 }
 
-// Charge @used ns of cpu time to the vtime of a task.
+// Charge @used ns of cpu time to the vtime of a task. While a wake boost runs,
+// with the weight of the waker: the woken task does the waker's work, and
+// charged with its own weight a light task (a nice 0 audio client woken by a
+// nice -12 audio server) used up its turn in the first slice and then waited
+// behind everything of higher weight anyway. The boost credit limits this to a
+// fifth of a core.
 static __always_inline void charge_vtime(const struct task_struct* p, struct task_ctx* tctx, u64 used)
 {
-  tctx->vtime += used * NICE_0_WEIGHT / task_weight(p);
+  u64 w = task_weight(p);
+  if (tctx->boost_slack && tctx->boost_weight > w)
+    w = tctx->boost_weight;
+  tctx->vtime += used * NICE_0_WEIGHT / w;
 }
 
 // Deadline from the time a task is queued, its slack and its lag. The lag goes
@@ -199,7 +216,23 @@ static __always_inline u64 make_deadline(u64 now, u64 slack, s64 lag)
 {
   if (lag > (s64)LAG_LATE_MAX_NS)
     lag = LAG_LATE_MAX_NS;
+  // Behind just as far at most: a deadline that is already long past would make
+  // take_overdue() run the task right away.
+  if (lag < -(s64)LAG_LATE_MAX_NS)
+    lag = -(s64)LAG_LATE_MAX_NS;
   return now + slack + lag;
+}
+
+// Dispatch of @cpu (this cpu) put @p into its local DSQ. The DSQ can't be looked
+// into, but right after a slice the task that runs next is already in it, and
+// balancing the task that comes back after its slice (pick_balance_cpu()) needs
+// to know how heavy it is: counting it as nice 0 kept a light task next to a
+// heavy one while another cpu had only light tasks.
+static __always_inline void note_local(u32 cpu, const struct task_struct* p)
+{
+  struct dispatch_ctx* dctx = get_dispatch_ctx(cpu);
+  if (dctx)
+    dctx->local_weight = task_weight(p);
 }
 
 // Slack of a task including a wake boost.
