@@ -13,6 +13,13 @@ const volatile u32 nr_llcs = 1;
 const volatile u32 cpu_to_llc[MAX_CPUS] = {};
 const volatile u8 cpu_online[MAX_CPUS] = {};
 
+// Set by the loader when the kernel has SCX_OPS_ALWAYS_ENQ_IMMED (7.1+): every
+// task put into a local DSQ either runs right away or comes back through
+// enqueue(), it never waits there. In particular a task preempted by an RT or
+// deadline task comes back right away (see reenq_preempted()), so the delayed
+// evacuation of RT-taken cpus isn't needed.
+const volatile bool enq_immed = false;
+
 struct task_ctx
 {
   // deadline in ns (see SLACK_NICE_0_NS) of the task in its queue, or of its
@@ -56,6 +63,9 @@ struct dispatch_ctx
   // weight of the task dispatch just put into the local DSQ of this cpu and
   // that hasn't started yet (see note_local())
   u64 local_weight;
+  // key of the woken task enqueue() put straight into the local DSQ to preempt
+  // the running one, until it starts (0: none)
+  u64 preempt_key;
   bool preempt_pending;
   // this cpu runs an RT or deadline task (as seen by the last sched_switch)
   bool rt_busy;

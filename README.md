@@ -22,7 +22,12 @@ cmake (3.20 or newer) clang lld pkgconf libbpf bpf
 kernel compiled with flag `CONFIG_DEBUG_INFO_BTF=y`
 
 Linux 6.18 or newer. 6.19 or newer is recommended, 6.18 loses a part of the realtime
-handling (see below).
+handling, 7.1 or newer hands tasks preempted by realtime tasks straight back (see
+below).
+
+Building needs the `include/vmlinux.h` of Linux 7.3 or newer (the scx headers in
+`include/` use its types). The built scheduler runs on older kernels as well, it checks
+at load time what the running kernel supports.
 
 for the kernel option you can just check if `/sys/kernel/btf/vmlinux` is present.
 
@@ -145,7 +150,9 @@ A waking task preempts the running task of its cpu when its key is earlier by mo
 into the local queue of the cpu with `SCX_ENQ_PREEMPT`, so the running task is preempted
 right away. A kick (`SCX_KICK_PREEMPT`) only takes effect through irq_work, which made a
 woken task wait about 1ms longer. The preempted task goes back into its queue with its
-key, deadline and the rest of its slice.
+key, deadline and the rest of its slice. When several tasks wake for the same cpu before
+it switched, only an earlier one replaces the task already on its way in (on 7.1+ the
+kernel hands the replaced one back to elara), a later one queues up behind it.
 
 When the slice of a task runs out, its vtime is updated. It keeps running for another
 slice if its new key is not later than the key of the first queued task.
@@ -214,13 +221,25 @@ tasks (`RT_CPU_LOAD`).
 
 Every switch to a realtime or deadline task is seen by a `sched_switch` tracepoint,
 which also keeps count of the cores taken by one (`nr_rt_busy`). An idle core is woken
-right away for the first task waiting in the queue of that core. If the realtime task
-keeps the core for 250us (`RT_EVACUATE_DELAY_NS`), the tasks already picked to run next
-on it (the task it preempted is the first of them) go back through placement. Most
-realtime tasks (irq threads, audio, the compositor) are done much sooner: the preempted
-task then just continues, instead of losing its place in the queue and being moved for
-nothing. A preempted task that would resume on a core taken by a realtime task goes
-through placement too.
+right away for the first task waiting in the queue of that core.
+
+On Linux 7.1 and newer elara sets `SCX_OPS_ALWAYS_ENQ_IMMED`: a task put into the local
+queue of a core (the one or two tasks the kernel runs next there) either runs right
+away or the kernel hands it back to elara, it never waits there. So a task preempted by
+a realtime task comes back at once, with its key, its deadline and the rest of its
+slice. If an allowed core is idle it continues there right away. Otherwise it goes to
+the front of the queue of its core: most realtime tasks (irq threads, audio, the
+compositor) are done in a moment and it just continues, and while the core stays taken
+the other cores take it over as soon as it is their earliest task (see Dispatch). A
+task the kernel can't run right away for another reason (two wakeups picked the same
+idle core, a realtime task woke up on the core it was picked for) comes back the same
+way, keeps its deadline and is placed again.
+
+Older kernels leave a preempted task at the head of the local queue, out of reach of
+the other cores. There, if the realtime task keeps the core for 250us
+(`RT_EVACUATE_DELAY_NS`), the tasks already picked to run next on it (the task it
+preempted is the first of them) go back through placement. A preempted task that would
+resume on a core taken by a realtime task goes through placement too.
 
 Tasks waiting in the queue of such a core are taken over by the other cores of its llc
 (see Dispatch): that core can't run them until the realtime task is done, so they lose

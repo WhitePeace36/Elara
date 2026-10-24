@@ -247,7 +247,7 @@ static __always_inline s32 pick_enqueue_cpu(struct task_struct* p, struct task_c
 // pinned to its cpu for the moment (migrate_disable()).
 static __always_inline bool can_take(struct task_struct* p, u32 cpu)
 {
-  return !p->migration_disabled && bpf_cpumask_test_cpu(cpu, p->cpus_ptr);
+  return !is_migration_disabled(p) && bpf_cpumask_test_cpu(cpu, p->cpus_ptr);
 }
 
 // Deadline of the first task in @dsq that @cpu may take (the queue is ordered by
@@ -463,7 +463,7 @@ static __always_inline void kick_idle_for_waiting(u32 cpu)
 {
   struct task_struct* p = dsq_first(cpu_dsq(cpu));
 
-  if (p && p->nr_cpus_allowed > 1 && !p->migration_disabled)
+  if (p && p->nr_cpus_allowed > 1 && !is_migration_disabled(p))
   {
     s32 idle = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
     if (idle >= 0)

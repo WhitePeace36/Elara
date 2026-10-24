@@ -235,6 +235,17 @@ static __always_inline void note_local(u32 cpu, const struct task_struct* p)
     dctx->local_weight = task_weight(p);
 }
 
+// @p comes back through enqueue() because an RT or deadline task preempted it
+// while it ran (SCX_ENQ_IMMED, see enq_immed). Kernels before 7.1 don't do
+// that: there the preempted task waits at the head of the local DSQ.
+static __always_inline bool reenq_preempted(const struct task_struct* p, u64 enq_flags)
+{
+  if (!(enq_flags & SCX_ENQ_REENQ) || !bpf_core_enum_value_exists(enum scx_ent_flags, SCX_TASK_REENQ_PREEMPTED))
+    return false;
+  u32 mask = bpf_core_enum_value(enum scx_ent_flags, SCX_TASK_REENQ_REASON_MASK);
+  return (p->scx.flags & mask) == bpf_core_enum_value(enum scx_ent_flags, SCX_TASK_REENQ_PREEMPTED);
+}
+
 // Slack of a task including a wake boost.
 static __always_inline u64 effective_slack(const struct task_struct* p, struct task_ctx* tctx)
 {

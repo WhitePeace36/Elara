@@ -280,6 +280,28 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
   if (enq_flags & SCX_ENQ_WAKEUP)
     apply_wake_boost(p, tctx);
 
+  // An RT or deadline task preempted it while it ran (enq_immed). It keeps its
+  // key, deadline and the rest of its slice. An idle cpu runs it right away.
+  // Otherwise it goes to the front of its own queue: most RT tasks are done in
+  // a moment, and while the cpu stays taken the other cpus take it over as
+  // soon as it is their earliest task (dispatch, step 1).
+  if (reenq_preempted(p, enq_flags))
+  {
+    tctx->resume_slice = 0;
+    u64 slice = p->scx.slice > RESUME_SLICE_MIN_NS ? p->scx.slice : RESUME_SLICE_MIN_NS;
+    s32 idle = p->nr_cpus_allowed > 1 && !is_migration_disabled(p) ? scx_bpf_pick_idle_cpu(p->cpus_ptr, 0) : -1;
+    if (idle >= 0 && cpu_is_online((u32)idle))
+    {
+      // running() moves the key over to the vtime of that cpu.
+      scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (u32)idle, slice, enq_flags);
+      scx_bpf_kick_cpu((u32)idle, SCX_KICK_IDLE);
+      return;
+    }
+    scx_bpf_dsq_insert_vtime(p, cpu_dsq(cpu), slice, tctx->key, enq_flags);
+    kick_idle_for_waiting(cpu);
+    return;
+  }
+
   // A preempted task goes back to its own queue with the rest of its slice, its
   // key and deadline, unless its cpu is taken by an RT task now: then it is
   // placed like any other.
@@ -301,10 +323,11 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
   bool reenq = enq_flags & SCX_ENQ_REENQ;
   u64 deadline = reenq ? tctx->deadline : make_deadline(now, slack, lag);
 
-  // A woken task goes where it runs soonest, a task that comes back after its
-  // slice is balanced by weight.
-  u32 target = (enq_flags & SCX_ENQ_WAKEUP) ? (u32)pick_enqueue_cpu(p, tctx, deadline, slack, cpu, now, true)
-                                            : (u32)pick_balance_cpu(p, tctx, slack, cpu, now);
+  // A woken task goes where it runs soonest, so does a re-enqueued one (it was
+  // about to run, see enq_immed), a task that comes back after its slice is
+  // balanced by weight.
+  u32 target = (enq_flags & SCX_ENQ_WAKEUP) || reenq ? (u32)pick_enqueue_cpu(p, tctx, deadline, slack, cpu, now, enq_flags & SCX_ENQ_WAKEUP)
+                                                     : (u32)pick_balance_cpu(p, tctx, slack, cpu, now);
   if (!cpu_is_online(target))
     target = cpu;
 
@@ -321,15 +344,25 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
   // preempted right away. A kick (SCX_KICK_PREEMPT) only takes effect through
   // irq_work, which on the test VM cost a woken task ~1.5ms more than EEVDF.
   bool preempt = (enq_flags & SCX_ENQ_WAKEUP) && running_ours && tctx->key + PREEMPT_MARGIN_NS < dctx->running_key;
+  // Another woken task is already on its way in front of the running one: an
+  // earlier task takes its place (with enq_immed the kernel hands that one
+  // back, otherwise it runs right after), a later one queues up behind it. The
+  // slice of that one ends on time (start_slice() arms the timer).
+  bool behind = preempt && dctx->preempt_key && tctx->key >= dctx->preempt_key;
+  if (behind)
+    preempt = false;
   if (preempt && tctx->key <= dsq_head_key(cpu_dsq(target)))
   {
     dctx->preempt_pending = true;
+    dctx->preempt_key = tctx->key;
     scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | target, SLICE_NS, enq_flags | SCX_ENQ_PREEMPT);
     return;
   }
 
   scx_bpf_dsq_insert_vtime(p, cpu_dsq(target), SLICE_NS, tctx->key, enq_flags);
 
+  if (behind)
+    return;
   if (!running_ours)
   {
     scx_bpf_kick_cpu(target, SCX_KICK_IDLE);
@@ -449,6 +482,7 @@ void BPF_STRUCT_OPS(elara_running, struct task_struct* p)
 
   // Out of the local DSQ (see note_local()).
   dispatch_ctx->local_weight = 0;
+  dispatch_ctx->preempt_key = 0;
 
   // Tasks the kernel queues by itself (exiting tasks and tasks with migration
   // disabled go straight to the local DSQ) come with its default slice of 20ms.
@@ -534,7 +568,8 @@ int BPF_PROG(elara_sched_switch, bool preempt, struct task_struct* prev, struct 
   if (!rt)
     return 0;
 
-  if (dsq_queued(SCX_DSQ_LOCAL_ON | cpu))
+  // With enq_immed the preempted task already came back through enqueue().
+  if (!enq_immed && dsq_queued(SCX_DSQ_LOCAL_ON | cpu))
   {
     u32 key = (cpu & (MAX_CPUS - 1)) + MAX_CPUS;
     struct elara_timer* st = bpf_map_lookup_elem(&slice_timers, &key);

@@ -54,6 +54,13 @@ static RunResult run_once()
   const u64 hotplug_seq = scx_hotplug_seq();
   skel->struct_ops.elara_ops->hotplug_seq = hotplug_seq;
 
+  // 7.1+: tasks in a local DSQ run right away or come back through enqueue()
+  // (0 on older kernels, which keep the delayed evacuation of RT-taken cpus).
+  const u64 always_immed = SCX_OPS_ALWAYS_ENQ_IMMED;
+  skel->struct_ops.elara_ops->flags |= always_immed;
+  skel->rodata->enq_immed = always_immed != 0;
+  std::cerr << "elara: SCX_OPS_ALWAYS_ENQ_IMMED " << (always_immed ? "on" : "not supported by this kernel") << std::endl;
+
   UEI_SET_SIZE(skel, elara_ops, uei);
 
   if (!setup_elara_topology(skel))
