@@ -13,8 +13,16 @@ enum ravg_consts {
 #ifdef __BPF__
 
 #ifndef __arena
+#ifdef SCX_ARENA_SCALAR
+#define __arena
+#else
 #define __arena __attribute__((address_space(1)))
+#endif
 #endif /* __arena */
+
+#ifndef __arg_arena
+#define __arg_arena __attribute((btf_decl_tag("arg:arena")))
+#endif /* __arg_arena */
 
 /*
  * Running avg mechanism. Accumulates values between 0 and RAVG_MAX_VAL in
@@ -50,15 +58,18 @@ struct ravg_data {
 int ravg_scale(struct ravg_data *rd, u32 mult, u32 rshift);
 u64 ravg_read(struct ravg_data *rd, u64 now, u64 half_life);
 int ravg_accumulate(struct ravg_data *rd, u64 new_val, u64 now, u32 half_life);
+/* the same operations on an average that lives in the arena */
+int ravg_scale_arena(struct ravg_data __arena __arg_arena *rd, u32 mult, u32 rshift);
+u64 ravg_read_arena(struct ravg_data __arena __arg_arena *rd, u64 now, u64 half_life);
+int ravg_accumulate_arena(struct ravg_data __arena __arg_arena *rd, u64 new_val, u64 now,
+			  u32 half_life);
 
-static RAVG_FN_ATTRS void ravg_add(u64 *sum, u64 addend)
+/* saturating add for the running sums */
+static RAVG_FN_ATTRS u64 ravg_sat_add(u64 a, u64 b)
 {
-	u64 new = *sum + addend;
+	u64 sum = a + b;
 
-	if (new >= *sum)
-		*sum = new;
-	else
-		*sum = -1;
+	return sum >= a ? sum : -1;
 }
 
 static RAVG_FN_ATTRS inline u64 ravg_decay(u64 v, u32 shift)

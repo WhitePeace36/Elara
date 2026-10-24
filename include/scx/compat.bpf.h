@@ -164,6 +164,27 @@ static inline void scx_bpf_kick_cid(s32 cid, u64 flags)
 }
 
 /*
+ * v7.3: 94480606a677 ("sched_ext: Add a size argument to scx_bpf_cid_topo() so
+ * struct scx_cid_topo can grow") added out__sz without renaming the kfunc, so
+ * the v7.2 and v7.3 kfuncs share a name with incompatible prototypes. Same
+ * two-flavor trick as scx_bpf_kick_cid() above. The size is always the output
+ * buffer's, so a macro supplies it and callers keep the two-argument form.
+ * Drop the wrapper and move the decl back to common.bpf.h after v7.6.
+ */
+void scx_bpf_cid_topo___v2(s32 cid, struct scx_cid_topo *out, size_t out__sz) __ksym __weak;
+void scx_bpf_cid_topo___v1(s32 cid, struct scx_cid_topo *out) __ksym __weak;
+
+static inline void __scx_bpf_cid_topo(s32 cid, struct scx_cid_topo *out, size_t out__sz)
+{
+	if (bpf_ksym_exists(scx_bpf_cid_topo___v2))
+		scx_bpf_cid_topo___v2(cid, out, out__sz);
+	else if (bpf_ksym_exists(scx_bpf_cid_topo___v1))
+		scx_bpf_cid_topo___v1(cid, out);
+}
+
+#define scx_bpf_cid_topo(cid, out) __scx_bpf_cid_topo((cid), (out), sizeof(*(out)))
+
+/*
  * v7.3: 3a21e34eb258 ("sched_ext: Gate scx_bpf_cidperf_set() behind a new
  * SCX_CAP_PERF") flipped the return type the other way, from void to s32, again
  * without renaming the kfunc. Same two-flavor trick as scx_bpf_kick_cid()
@@ -284,6 +305,18 @@ static inline bool __COMPAT_is_enq_cpu_selected(u64 enq_flags)
 	(bpf_ksym_exists(scx_bpf_pick_any_cpu_node) ?				\
 	 scx_bpf_pick_any_cpu_node(cpus_allowed, node, flags) :			\
 	 scx_bpf_pick_any_cpu(cpus_allowed, flags))
+
+/* v7.4: Add scx_bpf_cid_node(). */
+#define __COMPAT_scx_bpf_cid_node(cid)					\
+	(bpf_ksym_exists(scx_bpf_cid_node) ?				\
+	 scx_bpf_cid_node(cid) : NUMA_NO_NODE)
+
+/*
+ * v7.4: Add scx_bpf_cgroup_nr_cpus().
+ */
+#define __COMPAT_scx_bpf_cgroup_nr_cpus(cgrp)					\
+	(bpf_ksym_exists(scx_bpf_cgroup_nr_cpus) ?				\
+	 scx_bpf_cgroup_nr_cpus(cgrp) : scx_bpf_nr_cpu_ids())
 
 /*
  * v6.18: Add a helper to retrieve the current task running on a CPU.
@@ -429,20 +462,29 @@ scx_bpf_dsq_insert(struct task_struct *p, u64 dsq_id, u64 slice, u64 enq_flags)
 bool scx_bpf_task_set_slice___new(struct task_struct *p, u64 slice) __ksym __weak;
 bool scx_bpf_task_set_dsq_vtime___new(struct task_struct *p, u64 vtime) __ksym __weak;
 
-static inline void scx_bpf_task_set_slice(struct task_struct *p, u64 slice)
+static inline bool scx_bpf_task_set_slice(struct task_struct *p, u64 slice)
 {
 	if (bpf_ksym_exists(scx_bpf_task_set_slice___new))
-		scx_bpf_task_set_slice___new(p, slice);
-	else
-		p->scx.slice = slice;
+		return scx_bpf_task_set_slice___new(p, slice);
+	p->scx.slice = slice;
+	return true;
 }
 
-static inline void scx_bpf_task_set_dsq_vtime(struct task_struct *p, u64 vtime)
+static inline bool scx_bpf_task_set_dsq_vtime(struct task_struct *p, u64 vtime)
 {
 	if (bpf_ksym_exists(scx_bpf_task_set_dsq_vtime___new))
-		scx_bpf_task_set_dsq_vtime___new(p, vtime);
-	else
-		p->scx.dsq_vtime = vtime;
+		return scx_bpf_task_set_dsq_vtime___new(p, vtime);
+	p->scx.dsq_vtime = vtime;
+	return true;
+}
+
+/* v7.4: Add scx_bpf_task_set_lazy_resched(). */
+bool scx_bpf_task_set_lazy_resched___new(struct task_struct *p, bool lazy) __ksym __weak;
+
+static inline void scx_bpf_task_set_lazy_resched(struct task_struct *p, bool lazy)
+{
+	if (bpf_ksym_exists(scx_bpf_task_set_lazy_resched___new))
+		scx_bpf_task_set_lazy_resched___new(p, lazy);
 }
 
 /*
@@ -454,6 +496,12 @@ void scx_bpf_dsq_reenq___compat(u64 dsq_id, u64 reenq_flags) __ksym __weak;
 static inline bool __COMPAT_has_generic_reenq(void)
 {
 	return bpf_ksym_exists(scx_bpf_dsq_reenq___compat);
+}
+
+/* v7.4: Add scx_bpf_dsq_reenq_task(). */
+static inline bool __COMPAT_has_dsq_reenq_task(void)
+{
+	return bpf_ksym_exists(scx_bpf_dsq_reenq_task);
 }
 
 /*

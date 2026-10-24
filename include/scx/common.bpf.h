@@ -27,7 +27,9 @@
 #include "user_exit_info.bpf.h"
 #include "enum_defs.autogen.h"
 #include "../bpf_arena_common.bpf.h"
-#include <include/lib/const-defs.h>
+#include "const-defs.h"
+
+#define div_round_up(a, b) (((a) + (b) - 1) / (b))
 
 #define PF_IDLE				0x00000002	/* I am an IDLE thread */
 #define PF_IO_WORKER			0x00000010	/* Task is an IO worker */
@@ -75,6 +77,7 @@ struct task_struct *scx_bpf_dsq_peek(u64 dsq_id) __ksym __weak;
 int bpf_iter_scx_dsq_new(struct bpf_iter_scx_dsq *it, u64 dsq_id, u64 flags) __ksym __weak;
 struct task_struct *bpf_iter_scx_dsq_next(struct bpf_iter_scx_dsq *it) __ksym __weak;
 void bpf_iter_scx_dsq_destroy(struct bpf_iter_scx_dsq *it) __ksym __weak;
+bool scx_bpf_dsq_reenq_task(struct bpf_iter_scx_dsq *it, struct task_struct *p) __ksym __weak;
 void scx_bpf_exit_bstr(s64 exit_code, char *fmt, unsigned long long *data, u32 data__sz) __ksym __weak;
 void scx_bpf_error_bstr(char *fmt, unsigned long long *data, u32 data_len) __ksym;
 void scx_bpf_dump_bstr(char *fmt, unsigned long long *data, u32 data_len) __ksym __weak;
@@ -105,15 +108,17 @@ struct task_struct *scx_bpf_cpu_curr(s32 cpu) __ksym __weak;
 struct task_struct *scx_bpf_tid_to_task(u64 tid) __ksym __weak;
 u64 scx_bpf_now(void) __ksym __weak;
 void scx_bpf_events(struct scx_event_stats *events, size_t events__sz) __ksym __weak;
+u32 scx_bpf_cgroup_nr_cpus(struct cgroup *cgrp) __ksym __weak;
 s32 scx_bpf_cpu_to_cid(s32 cpu) __ksym __weak;
 s32 scx_bpf_cid_to_cpu(s32 cid) __ksym __weak;
-void scx_bpf_cid_topo(s32 cid, struct scx_cid_topo *out) __ksym __weak;
-/* scx_bpf_kick_cid() is declared in compat.bpf.h */
+s32 scx_bpf_cid_node(s32 cid) __ksym __weak;
+/* scx_bpf_cid_topo() and scx_bpf_kick_cid() are declared in compat.bpf.h */
 s32 scx_bpf_task_cid(const struct task_struct *p) __ksym __weak;
 s32 scx_bpf_this_cid(void) __ksym __weak;
 struct task_struct *scx_bpf_cid_curr(s32 cid) __ksym __weak;
 u32 scx_bpf_nr_cids(void) __ksym __weak;
 u32 scx_bpf_nr_online_cids(void) __ksym __weak;
+const void __arena *scx_bpf_online_cmask(void) __ksym __weak;
 u32 scx_bpf_cidperf_cap(s32 cid) __ksym __weak;
 u32 scx_bpf_cidperf_cur(s32 cid) __ksym __weak;
 /* scx_bpf_cidperf_set() is declared in compat.bpf.h */
@@ -123,6 +128,13 @@ s32 scx_bpf_sub_grant(u64 cgroup_id, u64 caps, const struct scx_cmask __arena *c
 void scx_bpf_sub_revoke(u64 cgroup_id, u64 caps, const struct scx_cmask __arena *cmask__arena) __ksym __weak;
 s32 scx_bpf_sub_caps(u64 cgroup_id, u64 caps, struct scx_cmask __arena *out__arena) __ksym __weak;
 s32 scx_bpf_sub_kill_bstr(u64 cgroup_id, char *fmt, unsigned long long *data, u32 data__sz) __ksym __weak;
+
+/*
+ * Spelled out instead of bpf_rcu_callback_t: that typedef only exists in the
+ * vmlinux.h of kernels newer than 7.3.
+ */
+int bpf_call_rcu(struct bpf_rcu_head *rh, void *map__const_map,
+				 int (*callback)(struct bpf_map *, void *, void *)) __ksym __weak;
 
 /*
  * Use the following as @it__iter when calling scx_bpf_dsq_move[_vtime]() from
@@ -307,7 +319,7 @@ BPF_PROG(name, ##args)
  * Similar to MEMBER_VPTR() but is intended for use with arrays where the
  * element count needs to be explicit.
  * It can be used in cases where a global array is defined with an initial
- * size but is intended to be be resized before loading the BPF program.
+ * size but is intended to be resized before loading the BPF program.
  * Without this version of the macro, MEMBER_VPTR() will use the compile time
  * size of the array to compute the max, which will result in rejection by
  * the verifier.
@@ -641,6 +653,10 @@ static inline bool is_migration_disabled(const struct task_struct *p)
 /* rcu */
 void bpf_rcu_read_lock(void) __ksym;
 void bpf_rcu_read_unlock(void) __ksym;
+
+/* irq */
+void bpf_local_irq_save(unsigned long *flags) __ksym __weak;
+void bpf_local_irq_restore(unsigned long *flags) __ksym __weak;
 
 /* resilient qspinlock */
 int bpf_res_spin_lock(struct bpf_res_spin_lock *lock) __ksym __weak;
@@ -1192,8 +1208,75 @@ static inline u64 scx_clock_irq(u32 cpu)
 #define struct_size_t(type, member, count)	\
 	struct_size((type *)NULL, member, count)
 
+/*
+ * <linux/stddef.h>'s TRAILING_OVERLAP(): embed a struct that ends in a flexible
+ * array member together with its storage. @NAME is a complete @TYPE and the
+ * @MEMBERS declared after the array reserve the space the array grows into.
+ * Unlike the kernel's, the padding is named after @NAME so that one struct can
+ * embed several, and it is sized with __builtin_offsetof() because
+ * bpf_helpers.h redefines offsetof() as a pointer cast, which is not a constant
+ * expression.
+ */
+#define __TRAILING_OVERLAP(TYPE, NAME, FAM, ATTRS, MEMBERS)			\
+	union {									\
+		TYPE NAME;							\
+		struct {							\
+			unsigned char __offset_to_##NAME[__builtin_offsetof(TYPE, FAM)]; \
+			MEMBERS							\
+		} ATTRS;							\
+	}
+
+#define TRAILING_OVERLAP(TYPE, NAME, FAM, MEMBERS)				\
+	__TRAILING_OVERLAP(TYPE, NAME, FAM, /* no attrs */, MEMBERS)
+
+/*
+ * Loop counters the verifier cannot see through.
+ *
+ * A may_goto loop converges when the state at its head is within the state
+ * of a previous iteration. A counter tracked as a precise constant prevents
+ * that convergence: every iteration creates a new state, and the verifier
+ * unrolls the loop until it runs out of budget whenever the counter feeds an
+ * operation that requires precision.
+ *
+ * Loading a writable global gives the verifier an unknown scalar while its
+ * runtime value remains one. Using it as the step makes the counter unknown
+ * after the first iteration, and the load on every increment keeps the loop
+ * body from making it precise again. volatile is required to keep the compiler
+ * from hoisting or eliminating the loads, and the value must remain non-const
+ * so the verifier cannot resolve it. The variable is weak so the objects linked
+ * into a scheduler share one copy. Its runtime value must never be changed from
+ * one.
+ *
+ * bpf_for() avoids this verifier behavior too, but calls bpf_iter_num_next()
+ * on every iteration. bpf_arena_for() is intended for hot scheduler walks
+ * where that cost matters. @var must be no wider than u32, and @start and
+ * @end must be representable as u32.
+ */
+volatile u32 bpf_arena_loop_one __weak = 1;
+
+/*
+ * A loop-carried accumulator that a caller later compares is kept precise, and
+ * a precise scalar whose range grows every iteration keeps a may_goto loop from
+ * converging. Initializing it from this zero makes it unknown from the first
+ * iteration, so every pass through the loop head looks the same.
+ */
+volatile u32 bpf_arena_loop_zero __weak = 0;
+
+#define __bpf_arena_loop_start(var, start)				\
+	({								\
+		_Static_assert(sizeof(var) <= sizeof(u32),		\
+			       "bpf_arena_for() index must fit in u32");	\
+		(start);						\
+	})
+
+#define bpf_arena_for(var, start, end)					\
+	for (var = __bpf_arena_loop_start(var, start);			\
+	     var < (end) && can_loop;					\
+	     var += bpf_arena_loop_one)
+
 #include "compat.bpf.h"
 #include "enums.bpf.h"
+#include "features.bpf.h"
 #include "cid.bpf.h"
 
 #endif	/* __SCX_COMMON_BPF_H */

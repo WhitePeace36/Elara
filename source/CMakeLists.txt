@@ -29,6 +29,7 @@ add_custom_command(
         -target bpf -g -O2 -Wall -Wno-compare-distinct-pointer-types -mcpu=v3 -D__TARGET_ARCH_${BPF_TARGET_ARCH} -mlittle-endian
         -I${CMAKE_CURRENT_SOURCE_DIR}
         -I${CMAKE_SOURCE_DIR}
+        -I${CMAKE_SOURCE_DIR}/include
         ${BPF_LIBBPF_INCLUDES}
         ${LIBBPF_CFLAGS_OTHER}
         -MD -MF ${BPF_OBJ}.d

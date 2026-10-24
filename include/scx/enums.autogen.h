@@ -9,14 +9,12 @@
 	SCX_ENUM_SET(skel, scx_public_consts, SCX_OPS_NAME_LEN); \
 	SCX_ENUM_SET(skel, scx_public_consts, SCX_SLICE_DFL); \
 	SCX_ENUM_SET(skel, scx_public_consts, SCX_SLICE_INF); \
+	SCX_ENUM_SET(skel, scx_consts, SCX_RESCUE_DISABLE); \
 	SCX_ENUM_SET(skel, scx_rq_flags, SCX_RQ_ONLINE); \
 	SCX_ENUM_SET(skel, scx_rq_flags, SCX_RQ_CAN_STOP_TICK); \
-	SCX_ENUM_SET(skel, scx_rq_flags, SCX_RQ_BAL_PENDING); \
-	SCX_ENUM_SET(skel, scx_rq_flags, SCX_RQ_BAL_KEEP); \
-	SCX_ENUM_SET(skel, scx_rq_flags, SCX_RQ_BYPASSING); \
 	SCX_ENUM_SET(skel, scx_rq_flags, SCX_RQ_CLK_VALID); \
 	SCX_ENUM_SET(skel, scx_rq_flags, SCX_RQ_IN_WAKEUP); \
-	SCX_ENUM_SET(skel, scx_rq_flags, SCX_RQ_IN_BALANCE); \
+	SCX_ENUM_SET(skel, scx_rq_flags, SCX_RQ_IN_DISPATCH); \
 	SCX_ENUM_SET(skel, scx_dsq_id_flags, SCX_DSQ_FLAG_BUILTIN); \
 	SCX_ENUM_SET(skel, scx_dsq_id_flags, SCX_DSQ_FLAG_LOCAL_ON); \
 	SCX_ENUM_SET(skel, scx_dsq_id_flags, SCX_DSQ_INVALID); \
@@ -37,15 +35,20 @@
 	SCX_ENUM_SET(skel, scx_ent_flags, SCX_TASK_INIT); \
 	SCX_ENUM_SET(skel, scx_ent_flags, SCX_TASK_READY); \
 	SCX_ENUM_SET(skel, scx_ent_flags, SCX_TASK_ENABLED); \
-	SCX_ENUM_SET(skel, scx_ent_flags, SCX_TASK_NR_STATES); \
 	SCX_ENUM_SET(skel, scx_ent_dsq_flags, SCX_TASK_DSQ_ON_PRIQ); \
 	SCX_ENUM_SET(skel, scx_kick_flags, SCX_KICK_IDLE); \
 	SCX_ENUM_SET(skel, scx_kick_flags, SCX_KICK_PREEMPT); \
 	SCX_ENUM_SET(skel, scx_kick_flags, SCX_KICK_WAIT); \
+	SCX_ENUM_SET(skel, scx_kick_flags, SCX_KICK_PREEMPT_LAZY); \
+	SCX_ENUM_SET(skel, scx_kick_flags, SCX_KICK_ALL_FLAGS); \
 	SCX_ENUM_SET(skel, scx_enq_flags, SCX_ENQ_WAKEUP); \
 	SCX_ENUM_SET(skel, scx_enq_flags, SCX_ENQ_HEAD); \
+	SCX_ENUM_SET(skel, scx_enq_flags, SCX_ENQ_CPU_SELECTED); \
 	SCX_ENUM_SET(skel, scx_enq_flags, SCX_ENQ_PREEMPT); \
+	SCX_ENUM_SET(skel, scx_enq_flags, SCX_ENQ_PREEMPT_LAZY); \
 	SCX_ENUM_SET(skel, scx_enq_flags, SCX_ENQ_IMMED); \
+	SCX_ENUM_SET(skel, scx_enq_flags, SCX_ENQ_RESCUE); \
+	SCX_ENUM_SET(skel, scx_enq_flags, SCX_ENQ_BLOCKED); \
 	SCX_ENUM_SET(skel, scx_enq_flags, SCX_ENQ_REENQ); \
 	SCX_ENUM_SET(skel, scx_enq_flags, SCX_ENQ_LAST); \
 	SCX_ENUM_SET(skel, scx_enq_flags, SCX_ENQ_CLEAR_OPSS); \

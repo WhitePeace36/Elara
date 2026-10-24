@@ -13,6 +13,14 @@
 struct scx_cgroup_bw_config {
 	/* verbose level */
 	int		verbose;
+
+	/*
+	 * Id of the library's root cgroup, 0 for the root of the cgroup v2
+	 * hierarchy. Only the cgroups below it are throttled: its own cpu.max
+	 * is left to whoever schedules it, and a cgroup outside its subtree is
+	 * never throttled.
+	 */
+	u64		root_cgrp_id;
 };
 
 /**
@@ -118,6 +126,17 @@ int scx_cgroup_bw_consume(struct task_struct *p __arg_trusted __arg_nullable, u6
  * Return 0 for success, -errno for failure.
  */
 int scx_cgroup_bw_put_aside(struct task_struct *p __arg_trusted, u64 taskc, u64 vtime);
+
+/**
+ * scx_cgroup_bw_kick_idle_cb - Wake a CPU after bandwidth replenishment.
+ *
+ * Called by the replenish timer after publishing replenishment results when the
+ * bw_kick_builtin_idle rodata knob is left off before load. The override claims
+ * and kicks an idle CPU through the scheduler's own idle tracking so dispatch
+ * runs even when all CPUs are idle. No kick is needed if every CPU is already
+ * busy. The weak default exits the scheduler with an error.
+ */
+void scx_cgroup_bw_kick_idle_cb(void);
 
 /**
  * scx_cgroup_bw_reenqueue - Reenqueue backlogged tasks.
@@ -228,7 +247,7 @@ int scx_cgroup_bw_move(struct task_struct *p __arg_trusted, u64 taskc,
 /**
  * scx_cgroup_bw_dump - Dump the cgroup status
  *
- * @cgrp_id: cgroup id
+ * @cgrp_id: cgroup id, 0 for the library's root
  * @descendent: If true, dump the cgroup and its descendent in preorder.
  * Otherwise, dump only itself.
  * @accurate: If true, update runtime total before dumping the status to

@@ -10,6 +10,7 @@
 
 #include <bpf_arena_common.bpf.h>
 #include <bpf_arena_spin_lock.h>
+#include <lib/spinlock.h>
 
 #else /* __BPF__ */
 
@@ -61,9 +62,8 @@ struct scx_stk {
 /*
  * Poor man's userspace-driven RCU for sdt allocations. Freed nodes accumulate
  * on the active side while the draining side sits out a grace period which
- * userspace provides, membarrier(MEMBARRIER_CMD_GLOBAL) being
- * synchronize_rcu(), before its nodes return to the allocator. Stands in until
- * BPF grows bpf_call_rcu().
+ * userspace provides, see rust/scx_arena, before its nodes return to the
+ * allocator. Stands in until BPF grows bpf_call_rcu().
  */
 struct scx_urcu {
 	__u64		head[2];	/* struct sdt_data ptrs linked via urcu_link */

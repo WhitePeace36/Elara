@@ -13,20 +13,14 @@ const volatile u64 __SCX_SLICE_DFL __weak;
 const volatile u64 __SCX_SLICE_INF __weak;
 #define SCX_SLICE_INF __SCX_SLICE_INF
 
+const volatile u64 __SCX_RESCUE_DISABLE __weak;
+#define SCX_RESCUE_DISABLE __SCX_RESCUE_DISABLE
+
 const volatile u64 __SCX_RQ_ONLINE __weak;
 #define SCX_RQ_ONLINE __SCX_RQ_ONLINE
 
 const volatile u64 __SCX_RQ_CAN_STOP_TICK __weak;
 #define SCX_RQ_CAN_STOP_TICK __SCX_RQ_CAN_STOP_TICK
-
-const volatile u64 __SCX_RQ_BAL_PENDING __weak;
-#define SCX_RQ_BAL_PENDING __SCX_RQ_BAL_PENDING
-
-const volatile u64 __SCX_RQ_BAL_KEEP __weak;
-#define SCX_RQ_BAL_KEEP __SCX_RQ_BAL_KEEP
-
-const volatile u64 __SCX_RQ_BYPASSING __weak;
-#define SCX_RQ_BYPASSING __SCX_RQ_BYPASSING
 
 const volatile u64 __SCX_RQ_CLK_VALID __weak;
 #define SCX_RQ_CLK_VALID __SCX_RQ_CLK_VALID
@@ -34,8 +28,8 @@ const volatile u64 __SCX_RQ_CLK_VALID __weak;
 const volatile u64 __SCX_RQ_IN_WAKEUP __weak;
 #define SCX_RQ_IN_WAKEUP __SCX_RQ_IN_WAKEUP
 
-const volatile u64 __SCX_RQ_IN_BALANCE __weak;
-#define SCX_RQ_IN_BALANCE __SCX_RQ_IN_BALANCE
+const volatile u64 __SCX_RQ_IN_DISPATCH __weak;
+#define SCX_RQ_IN_DISPATCH __SCX_RQ_IN_DISPATCH
 
 const volatile u64 __SCX_DSQ_FLAG_BUILTIN __weak;
 #define SCX_DSQ_FLAG_BUILTIN __SCX_DSQ_FLAG_BUILTIN
@@ -97,9 +91,6 @@ const volatile u64 __SCX_TASK_READY __weak;
 const volatile u64 __SCX_TASK_ENABLED __weak;
 #define SCX_TASK_ENABLED __SCX_TASK_ENABLED
 
-const volatile u64 __SCX_TASK_NR_STATES __weak;
-#define SCX_TASK_NR_STATES __SCX_TASK_NR_STATES
-
 const volatile u64 __SCX_TASK_DSQ_ON_PRIQ __weak;
 #define SCX_TASK_DSQ_ON_PRIQ __SCX_TASK_DSQ_ON_PRIQ
 
@@ -112,17 +103,35 @@ const volatile u64 __SCX_KICK_PREEMPT __weak;
 const volatile u64 __SCX_KICK_WAIT __weak;
 #define SCX_KICK_WAIT __SCX_KICK_WAIT
 
+const volatile u64 __SCX_KICK_PREEMPT_LAZY __weak;
+#define SCX_KICK_PREEMPT_LAZY __SCX_KICK_PREEMPT_LAZY
+
+const volatile u64 __SCX_KICK_ALL_FLAGS __weak;
+#define SCX_KICK_ALL_FLAGS __SCX_KICK_ALL_FLAGS
+
 const volatile u64 __SCX_ENQ_WAKEUP __weak;
 #define SCX_ENQ_WAKEUP __SCX_ENQ_WAKEUP
 
 const volatile u64 __SCX_ENQ_HEAD __weak;
 #define SCX_ENQ_HEAD __SCX_ENQ_HEAD
 
+const volatile u64 __SCX_ENQ_CPU_SELECTED __weak;
+#define SCX_ENQ_CPU_SELECTED __SCX_ENQ_CPU_SELECTED
+
 const volatile u64 __SCX_ENQ_PREEMPT __weak;
 #define SCX_ENQ_PREEMPT __SCX_ENQ_PREEMPT
 
+const volatile u64 __SCX_ENQ_PREEMPT_LAZY __weak;
+#define SCX_ENQ_PREEMPT_LAZY __SCX_ENQ_PREEMPT_LAZY
+
 const volatile u64 __SCX_ENQ_IMMED __weak;
 #define SCX_ENQ_IMMED __SCX_ENQ_IMMED
+
+const volatile u64 __SCX_ENQ_RESCUE __weak;
+#define SCX_ENQ_RESCUE __SCX_ENQ_RESCUE
+
+const volatile u64 __SCX_ENQ_BLOCKED __weak;
+#define SCX_ENQ_BLOCKED __SCX_ENQ_BLOCKED
 
 const volatile u64 __SCX_ENQ_REENQ __weak;
 #define SCX_ENQ_REENQ __SCX_ENQ_REENQ
