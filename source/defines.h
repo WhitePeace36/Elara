@@ -70,6 +70,18 @@
 #define STARVE_CHECK_INTERVAL_NS (10ULL * NS_PER_MS)
 #define STARVE_SCAN_DEPTH 32
 
+// A cpu whose queue doesn't move is stuck: it has tasks queued, but for STUCK_NS
+// it neither started one nor let one run on for another slice (counted from the
+// last of these, or from when its queue got its first task). That happens to a
+// cpu going offline: the kernel stops running tasks on it a while before it
+// stops the scheduler, and waits for an RCU grace period in between, so an RCU
+// kthread queued there stalls the whole system. It also happens to a cpu held
+// by long interrupt work. Other cpus take the tasks of a stuck cpu like those of
+// a cpu taken by an RT task, and placement treats it as busy. Each cpu looks for
+// stuck cpus every STUCK_CHECK_INTERVAL_NS.
+#define STUCK_NS (4 * SLICE_NS)
+#define STUCK_CHECK_INTERVAL_NS (4ULL * NS_PER_MS)
+
 // A woken task gets this fraction of its slack (1 / WAKE_SLACK_DIV). Without it
 // a task that wakes up lands behind every task of the same nice value that keeps
 // running, because those were queued earlier.

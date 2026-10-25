@@ -278,6 +278,15 @@ migration-disabled), and of those the first in that core's queue (at most
 When cpus go online or offline (for example when toggling SMT) the kernel stops
 the scheduler, and elara restarts itself with the new topology.
 
+A cpu going offline stops running tasks a while before the kernel stops the
+scheduler, and in between the kernel waits for an RCU grace period. Tasks still
+queued on that cpu would wait for good: with the RCU kthread among them, the whole
+system stalled for 20s until the kernel's RCU stall detection ejected elara. So a
+cpu whose queue doesn't move (tasks queued, but none started or kept running for
+4 slices, `STUCK_NS`, counted from when its queue got its first task) counts as stuck: the other cpus take its tasks like those of a
+cpu taken by a realtime task, and placement treats it as busy. Each cpu looks for
+stuck cpus every 4ms. This also covers a cpu held by long interrupt work.
+
 ## Testing
 
 There where 2 design goals for this scheduler.

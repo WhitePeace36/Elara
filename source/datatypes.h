@@ -56,6 +56,11 @@ struct dispatch_ctx
   u64 vtime_ref;
   // last time this cpu looked for overdue tasks in its queue
   u64 last_starve_check;
+  // last time a task started on this cpu or kept it for another slice, or its
+  // queue got its first task, and last time this cpu looked for stuck cpus
+  // (see STUCK_NS)
+  u64 last_progress;
+  u64 last_stuck_check;
   // when the slice of the running task ends, and when the slice timer fires (0:
   // not set)
   u64 slice_end;

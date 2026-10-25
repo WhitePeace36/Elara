@@ -123,6 +123,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(elara_init)
     dispatch_ctx->running_key = DEADLINE_NONE;
     dispatch_ctx->vtime_ref = VTIME_BASE;
     dispatch_ctx->last_starve_check = 0;
+    dispatch_ctx->last_progress = 0;
+    dispatch_ctx->last_stuck_check = 0;
     dispatch_ctx->slice_end = 0;
     dispatch_ctx->timer_end = 0;
     dispatch_ctx->local_weight = 0;
@@ -272,6 +274,7 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
 
   if (!tctx)
   {
+    queue_on(cpu, now);
     scx_bpf_dsq_insert_vtime(p, cpu_dsq(cpu), SLICE_NS, cpu_vtime_ref(cpu) + task_slack(p), enq_flags);
     scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
     return;
@@ -297,6 +300,7 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
       scx_bpf_kick_cpu((u32)idle, SCX_KICK_IDLE);
       return;
     }
+    queue_on(cpu, now);
     scx_bpf_dsq_insert_vtime(p, cpu_dsq(cpu), slice, tctx->key, enq_flags);
     kick_idle_for_waiting(cpu);
     return;
@@ -312,6 +316,7 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
   {
     u64 slice = tctx->resume_slice;
     tctx->resume_slice = 0;
+    queue_on(cpu, now);
     scx_bpf_dsq_insert_vtime(p, cpu_dsq(cpu), slice, tctx->key, enq_flags);
     return;
   }
@@ -359,6 +364,7 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
     return;
   }
 
+  queue_on(target, now);
   scx_bpf_dsq_insert_vtime(p, cpu_dsq(target), SLICE_NS, tctx->key, enq_flags);
 
   if (behind)
@@ -395,6 +401,13 @@ void BPF_STRUCT_OPS(elara_dispatch, s32 cpu, struct task_struct* prev)
   struct task_ctx* pctx = NULL;
   struct dispatch_ctx* dctx = get_dispatch_ctx(cpu);
   u64 now = bpf_ktime_get_ns();
+
+  // The kernel only asks for a task when the local DSQ is empty: a task that
+  // enqueue() put there to preempt (see preempt_key) is gone without having
+  // started (handed back with enq_immed, dequeued). Otherwise its key would keep
+  // later wakeups from preempting until the next task starts here.
+  if (dctx)
+    dctx->preempt_key = 0;
 
   if (prev && (prev->scx.flags & SCX_TASK_QUEUED))
   {
@@ -446,6 +459,7 @@ void BPF_STRUCT_OPS(elara_dispatch, s32 cpu, struct task_struct* prev)
 
   pctx->key = prev_key;
   pctx->deadline = prev_deadline;
+  dctx->last_progress = now;
   scx_bpf_task_set_slice(prev, SLICE_NS);
   pctx->granted_slice = SLICE_NS;
   start_slice(cpu, dctx, now, SLICE_NS);
@@ -456,13 +470,15 @@ void BPF_STRUCT_OPS(elara_dispatch, s32 cpu, struct task_struct* prev)
 
 void BPF_STRUCT_OPS(elara_running, struct task_struct* p)
 {
-  struct task_ctx* context = get_task_ctx(p);
-  if (!context)
-    return;
-
   u32 cpu = scx_bpf_task_cpu(p);
   struct dispatch_ctx* dispatch_ctx = get_dispatch_ctx(cpu);
   if (!dispatch_ctx)
+    return;
+  // A task started: the queue of this cpu moves (see cpu_stuck()).
+  dispatch_ctx->last_progress = bpf_ktime_get_ns();
+
+  struct task_ctx* context = get_task_ctx(p);
+  if (!context)
     return;
 
   // A task taken over from another cpu brings its lag along, its key moves to
