@@ -124,7 +124,6 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(elara_init)
     dispatch_ctx->vtime_ref = VTIME_BASE;
     dispatch_ctx->last_starve_check = 0;
     dispatch_ctx->last_progress = 0;
-    dispatch_ctx->last_stuck_check = 0;
     dispatch_ctx->slice_end = 0;
     dispatch_ctx->timer_end = 0;
     dispatch_ctx->local_weight = 0;
@@ -189,6 +188,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(elara_init_task, struct task_struct* p, struct scx_
   tctx->granted_slice = 0;
   tctx->resume_slice = 0;
   tctx->last_migrated_at = 0;
+  tctx->upmigrate_cpu = 0;
 
   return 0;
 }
@@ -267,7 +267,21 @@ s32 BPF_STRUCT_OPS(elara_select_cpu, struct task_struct* p, s32 prev_cpu, u64 wa
   if (tctx && (wake_flags & SCX_WAKE_TTWU))
     apply_wake_boost(p, tctx);
 
-  s32 cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
+  // With fast and slower cores: an idle cpu of the kind the task prefers, its
+  // previous one if that is such a cpu and idle.
+  s32 cpu = -1;
+  if (hybrid && tctx && p->nr_cpus_allowed > 1)
+  {
+    bool fast = wants_fast_core(p, tctx);
+    if ((fast || wants_slow_core(p, tctx)) && (cpu_cap(prev_cpu) >= 1024) == fast && bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
+        scx_bpf_test_and_clear_cpu_idle(prev_cpu))
+      cpu = prev_cpu;
+    else
+      cpu = claim_idle_preferred(p, tctx);
+    is_idle = cpu >= 0;
+  }
+  if (cpu < 0)
+    cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
 
   // Run directly on the idle cpu, unless tasks with an earlier deadline are
   // already queued there (their kick is still on the way): the local DSQ runs
@@ -293,6 +307,33 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
   u32 cpu = scx_bpf_task_cpu(p);
   u64 now = bpf_ktime_get_ns();
 
+  // With SMT or fast and slower cores (SCX_OPS_ENQ_LAST): dispatch didn't let
+  // the task go on alone on its cpu because a better one is idle
+  // (upmigrate_cpu), or it found nothing to run at all. The cpu is about to go
+  // idle.
+  if (enq_flags & SCX_ENQ_LAST)
+  {
+    u32 up = tctx ? tctx->upmigrate_cpu : 0;
+    if (tctx)
+      tctx->upmigrate_cpu = 0;
+    if (up && cpu_is_online(up - 1) && bpf_cpumask_test_cpu(up - 1, p->cpus_ptr))
+    {
+      scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (up - 1), SLICE_NS, enq_flags);
+      scx_bpf_kick_cpu(up - 1, SCX_KICK_IDLE);
+      return;
+    }
+    scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SLICE_NS, enq_flags);
+    return;
+  }
+
+  // The kernel put the task back another way (an RT task took the cpu first):
+  // the cpu claimed for it stays idle, kicked so it counts as idle again.
+  if (tctx && tctx->upmigrate_cpu)
+  {
+    scx_bpf_kick_cpu(tctx->upmigrate_cpu - 1, SCX_KICK_IDLE);
+    tctx->upmigrate_cpu = 0;
+  }
+
   if (!tctx)
   {
     queue_on(cpu, now);
@@ -313,7 +354,7 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
   {
     tctx->resume_slice = 0;
     u64 slice = p->scx.slice > RESUME_SLICE_MIN_NS ? p->scx.slice : RESUME_SLICE_MIN_NS;
-    s32 idle = p->nr_cpus_allowed > 1 && !is_migration_disabled(p) ? scx_bpf_pick_idle_cpu(p->cpus_ptr, 0) : -1;
+    s32 idle = p->nr_cpus_allowed > 1 && !is_migration_disabled(p) ? pick_idle(p, tctx) : -1;
     if (idle >= 0 && cpu_is_online((u32)idle))
     {
       // running() moves the key over to the vtime of that cpu.
@@ -459,8 +500,34 @@ void BPF_STRUCT_OPS(elara_dispatch, s32 cpu, struct task_struct* prev)
     }
   }
 
-  if (!dispatch_dsq_per_cpu(cpu, prev_key, prev_deadline) || !prev || !pctx || !dctx)
+  u32 res = dispatch_dsq_per_cpu(cpu, prev_key, prev_deadline);
+  if (res == DSP_TOOK || !prev || !(prev->scx.flags & SCX_TASK_QUEUED))
     return;
+
+  // Nothing else to run and prev can go on (a task without context): the kernel
+  // keeps it running, with its default slice of 20ms if prev's is used up.
+  if (res == DSP_NONE || !pctx || !dctx)
+  {
+    scx_bpf_task_set_slice(prev, SLICE_NS);
+    if (dctx)
+      dctx->last_progress = now;
+    return;
+  }
+
+  // prev runs alone, and an idle cpu is clearly better for it (see
+  // better_cpu_alone()): its slice stays used up, so the kernel hands it to
+  // enqueue() (SCX_ENQ_LAST), which moves it there. The idle cpu can't take
+  // over a running task by itself.
+  if ((hybrid || smt) && !dsq_queued(cpu_dsq(cpu)))
+  {
+    s32 better = better_cpu_alone(prev, pctx, cpu, now);
+    if (better >= 0)
+    {
+      pctx->upmigrate_cpu = (u32)better + 1;
+      pctx->last_migrated_at = now;
+      return;
+    }
+  }
 
   // prev keeps running for a new slice, a boost left over from a preemption
   // that didn't replace it ends here once its budget is used up.
@@ -527,6 +594,7 @@ void BPF_STRUCT_OPS(elara_running, struct task_struct* p)
     scx_bpf_task_set_slice(p, SLICE_NS);
 
   context->started_at = bpf_ktime_get_ns();
+  context->upmigrate_cpu = 0;
   context->granted_slice = p->scx.slice;
   context->resume_slice = 0;
   start_slice(cpu, dispatch_ctx, context->started_at, p->scx.slice);

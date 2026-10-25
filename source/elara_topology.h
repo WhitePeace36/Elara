@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -21,6 +22,9 @@ struct Topology
   std::uint32_t nr_llcs = 0;
   std::vector<std::uint32_t> cpu_to_llc;  // nr_cpu_ids entries, offline -> 0
   std::vector<bool> cpu_online;           // nr_cpu_ids entries
+  std::vector<std::uint32_t> cpu_capacity;  // nr_cpu_ids entries, 1024 = fastest core
+  std::vector<std::int32_t> cpu_sibling;    // nr_cpu_ids entries, another cpu of the same core, -1: none
+  bool smt = false;                         // a core runs more than one cpu
 };
 
 namespace detail
@@ -160,6 +164,8 @@ inline std::optional<Topology> read_topology(const fs::path& cpu_root = "/sys/de
   topo.nr_cpu_ids = max_cpu_id + 1;
   topo.cpu_to_llc.assign(topo.nr_cpu_ids, 0);
   topo.cpu_online.assign(topo.nr_cpu_ids, false);
+  topo.cpu_capacity.assign(topo.nr_cpu_ids, 1024);
+  topo.cpu_sibling.assign(topo.nr_cpu_ids, -1);
 
   std::map<std::string, std::uint32_t> group_to_dense;
 
@@ -175,6 +181,20 @@ inline std::optional<Topology> read_topology(const fs::path& cpu_root = "/sys/de
       key = cache_group_key(cpu_dir, 2);
     if (!key)
       key = "nocache";
+
+    // Relative speed of the core (1024: the fastest ones). Only differs on cpus
+    // with performance and efficiency cores.
+    const long capacity = read_long_file(cpu_dir / "cpu_capacity").value_or(1024);
+    topo.cpu_capacity[cpu] = capacity > 0 ? static_cast<std::uint32_t>(capacity) : 1024;
+
+    if (const auto siblings = read_cpulist_file(cpu_dir / "topology" / "thread_siblings_list"))
+      for (const auto sibling : *siblings)
+        if (sibling != cpu)
+        {
+          topo.smt = true;
+          topo.cpu_sibling[cpu] = static_cast<std::int32_t>(sibling);
+          break;
+        }
 
     const std::string full_key = "p" + std::to_string(package) + ":" + *key;
     const auto [it, inserted] = group_to_dense.try_emplace(full_key, static_cast<std::uint32_t>(group_to_dense.size()));
@@ -220,17 +240,47 @@ bool setup_elara_topology(Skel* skel, const std::filesystem::path& cpu_root = "/
   }
 
   std::uint32_t nr_online = 0;
+  std::uint32_t cap_max = 0;
   for (std::uint32_t cpu = 0; cpu < topo->nr_cpu_ids; ++cpu)
   {
     if (topo->cpu_online[cpu])
+    {
       ++nr_online;
+      cap_max = std::max(cap_max, topo->cpu_capacity[cpu]);
+    }
   }
 
-  std::cerr << "elara: topology: " << topo->nr_cpu_ids << " cpu ids (" << nr_online << " online), " << topo->nr_llcs << " llc domain(s)\n";
+  // Cores slower than the fastest ones (efficiency cores) and the fastest ones,
+  // each list sorted by capacity, fastest first.
+  std::vector<std::uint32_t> big, little;
+  for (std::uint32_t cpu = 0; cpu < topo->nr_cpu_ids; ++cpu)
+  {
+    if (!topo->cpu_online[cpu])
+      continue;
+    (topo->cpu_capacity[cpu] < cap_max ? little : big).push_back(cpu);
+  }
+  std::stable_sort(little.begin(), little.end(), [&](std::uint32_t a, std::uint32_t b) { return topo->cpu_capacity[a] > topo->cpu_capacity[b]; });
+  for (std::uint32_t i = 0; i < big.size(); ++i)
+    skel->rodata->big_cpus[i] = static_cast<std::uint16_t>(big[i]);
+  for (std::uint32_t i = 0; i < little.size(); ++i)
+    skel->rodata->little_cpus[i] = static_cast<std::uint16_t>(little[i]);
+  skel->rodata->nr_big_cpus = static_cast<std::uint32_t>(big.size());
+  skel->rodata->nr_little_cpus = static_cast<std::uint32_t>(little.size());
+  skel->rodata->hybrid = !little.empty();
+  skel->rodata->smt = topo->smt;
+  for (std::uint32_t cpu = 0; cpu < topo->nr_cpu_ids; ++cpu)
+  {
+    skel->rodata->cpu_capacity[cpu] = static_cast<std::uint16_t>(cap_max ? topo->cpu_capacity[cpu] * 1024 / cap_max : 1024);
+    const std::int32_t sibling = topo->cpu_sibling[cpu];
+    skel->rodata->cpu_sibling[cpu] = sibling >= 0 && topo->cpu_online[sibling] ? sibling : -1;
+  }
+
+  std::cerr << "elara: topology: " << topo->nr_cpu_ids << " cpu ids (" << nr_online << " online), " << topo->nr_llcs << " llc domain(s), smt "
+            << (topo->smt ? "on" : "off") << ", " << (little.empty() ? "all cores equally fast" : std::to_string(big.size()) + " fast and " + std::to_string(little.size()) + " slower cores") << "\n";
   for (std::uint32_t cpu = 0; cpu < topo->nr_cpu_ids; ++cpu)
   {
     if (topo->cpu_online[cpu])
-      std::cerr << "  cpu" << cpu << " -> llc" << topo->cpu_to_llc[cpu] << "\n";
+      std::cerr << "  cpu" << cpu << " -> llc" << topo->cpu_to_llc[cpu] << ", capacity " << topo->cpu_capacity[cpu] << "\n";
     else
       std::cerr << "  cpu" << cpu << " offline -> llc0 (unused)\n";
   }

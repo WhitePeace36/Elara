@@ -70,6 +70,12 @@ static RunResult run_once()
     return RunResult::Failed;
   }
 
+  // With SMT or fast and slower cores: a task that runs alone on a cpu while a
+  // better one is idle is handed back through enqueue() at the end of its slice
+  // instead of continuing there (see elara_dispatch()).
+  if (skel->rodata->hybrid || skel->rodata->smt)
+    skel->struct_ops.elara_ops->flags |= SCX_OPS_ENQ_LAST;
+
   int err = elara_bpf__load(skel);
   if (err)
   {

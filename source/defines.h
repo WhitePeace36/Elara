@@ -77,10 +77,16 @@
 // stops the scheduler, and waits for an RCU grace period in between, so an RCU
 // kthread queued there stalls the whole system. It also happens to a cpu held
 // by long interrupt work. Other cpus take the tasks of a stuck cpu like those of
-// a cpu taken by an RT task, and placement treats it as busy. Each cpu looks for
-// stuck cpus every STUCK_CHECK_INTERVAL_NS.
+// a cpu taken by an RT task, and placement treats it as busy. Every
+// STUCK_CHECK_INTERVAL_NS one cpu looks for stuck cpus for all (scan_stuck()).
 #define STUCK_NS (4 * SLICE_NS)
 #define STUCK_CHECK_INTERVAL_NS (4ULL * NS_PER_MS)
+
+// Taking a task over from a cpu taken by an RT task or a stuck cpu, a cpu looks
+// at this many tasks of its queue for one it may run: the first ones are often
+// that cpu's own kernel threads (shortest slack), which can't move. Normal
+// stealing looks at STEAL_SCAN_DEPTH.
+#define RESCUE_SCAN_DEPTH 64
 
 // A woken task gets this fraction of its slack (1 / WAKE_SLACK_DIV). Without it
 // a task that wakes up lands behind every task of the same nice value that keeps
@@ -110,7 +116,7 @@
 
 // When a cpu takes a task from another cpu, only tasks that may run on it count
 // (affinity, migration disabled). At most this many tasks of a queue are looked
-// at for the first such task.
+// at for the first such task (see also RESCUE_SCAN_DEPTH).
 #define STEAL_SCAN_DEPTH 8
 
 #define DSQ_BASE 1536

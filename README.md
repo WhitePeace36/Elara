@@ -230,6 +230,27 @@ its caches.
 
 Offline cores (for example the second threads with SMT off) are never used.
 
+### SMT
+
+With SMT (two cpus per core) a cpu whose sibling is busy gets only part of the core.
+So wherever elara picks an idle cpu itself, a cpu of a whole idle core comes first, and
+only then any idle cpu. A woken task whose own cpu is free but whose sibling is busy
+moves to a whole idle core if there is one. A task that keeps running alone on a cpu
+whose sibling is busy moves to a whole idle core at the end of its slice (at most once
+every 10ms): an idle cpu can't take over a running task itself, so dispatch doesn't
+extend its slice and the kernel hands it back to enqueue() (`SCX_OPS_ENQ_LAST`, only
+set with SMT or fast and slower cores), which puts it there.
+
+### Fast and slower cores
+
+On cpus with performance and efficiency cores (`cpu_capacity` in sysfs below the
+fastest one), tasks more important than nice 0 (a lower nice value, or a wake boost
+from such a task) go to idle fast cores first, tasks less important than nice 0 to idle
+slower ones first, nice 0 takes any. A task that runs alone on a core of the other kind
+while one of its kind is idle moves there at the end of its slice, the same way as with
+SMT. Balancing by weight counts a slower core heavier by its speed: it gets through the
+same work in more time.
+
 ### Realtime and deadline tasks
 
 Tasks with SCHED_FIFO, SCHED_RR or SCHED_DEADLINE (kwin, irq threads, ...) run above
@@ -274,10 +295,11 @@ NAPI, irq storms).
 
 When a core needs its next task:
 
-1. If a core runs a realtime task (`nr_rt_busy`): the earliest task waiting on a core
-   of its llc taken by a realtime task, if its deadline is earlier than the core's own
-   next task (or it has none). Then the same for cores of other llcs, so a task that may
-   only run on its realtime core and on cores of another llc isn't stuck there.
+1. If a core is stuck (see CPU hotplug) or runs a realtime task (`nr_rt_busy`): the
+   earliest task waiting on such a core, if its deadline is earlier than the core's own
+   next task (or it has none). For realtime tasks first the cores of its llc, then the
+   cores of other llcs, so a task that may only run on its realtime core and on cores of
+   another llc isn't stuck there.
 2. A task of its own queue more than 500ms past its deadline (see above).
 3. Its own next task: the running task for another slice or the first one of its queue,
    by key.
@@ -287,8 +309,14 @@ When a core needs its next task:
 5. Then the task with the earliest deadline on cores of other llcs.
 
 From another core only tasks count that may run on this one (affinity, not
-migration-disabled), and of those the first in that core's queue (at most
-`STEAL_SCAN_DEPTH` tasks are looked at).
+migration-disabled), and of those the first in that core's queue: at most 8 tasks are
+looked at (`STEAL_SCAN_DEPTH`), 64 when taking tasks from a stuck core or one taken by a
+realtime task (`RESCUE_SCAN_DEPTH`). The first tasks there are often that core's own
+kernel threads, which can't move.
+
+When dispatch finds nothing else to run and the previous task goes on (a task elara
+has no context for), its slice is set to 1ms: the kernel would keep it running with its
+own default of 20ms.
 
 ## CPU hotplug
 
@@ -301,8 +329,10 @@ queued on that cpu would wait for good: with the RCU kthread among them, the who
 system stalled for 20s until the kernel's RCU stall detection ejected elara. So a
 cpu whose queue doesn't move (tasks queued, but none started or kept running for
 4 slices, `STUCK_NS`, counted from when its queue got its first task) counts as stuck: the other cpus take its tasks like those of a
-cpu taken by a realtime task, and placement treats it as busy. Each cpu looks for
-stuck cpus every 4ms. This also covers a cpu held by long interrupt work.
+cpu taken by a realtime task, and placement treats it as busy. Every 4ms one cpu (the
+first to get there) looks for stuck cpus and marks them; the others only check that
+mark, so the check costs one scan of all cpus per 4ms for the whole system. This also
+covers a cpu held by long interrupt work.
 
 ## Testing
 

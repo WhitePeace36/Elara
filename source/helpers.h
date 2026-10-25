@@ -246,6 +246,27 @@ static __always_inline bool reenq_preempted(const struct task_struct* p, u64 enq
   return (p->scx.flags & mask) == bpf_core_enum_value(enum scx_ent_flags, SCX_TASK_REENQ_PREEMPTED);
 }
 
+// Relative speed of @cpu, 1024 for the fastest cores.
+static __always_inline u32 cpu_cap(u32 cpu)
+{
+  cpu &= (MAX_CPUS - 1);
+  u32 cap = cpu_capacity[cpu];
+  return cap ? cap : 1024;
+}
+
+// With fast and slower cores: tasks more important than nice 0 (a lower nice
+// value, or a wake boost from such a task) go to the fast cores first, tasks
+// less important than nice 0 to the slower ones. Nice 0 takes any.
+static __always_inline bool wants_fast_core(const struct task_struct* p, const struct task_ctx* tctx)
+{
+  return task_weight(p) > NICE_0_WEIGHT || (tctx && tctx->boost_slack && tctx->boost_weight > NICE_0_WEIGHT);
+}
+
+static __always_inline bool wants_slow_core(const struct task_struct* p, const struct task_ctx* tctx)
+{
+  return task_weight(p) < NICE_0_WEIGHT && !(tctx && tctx->boost_slack);
+}
+
 // Slack of a task including a wake boost.
 static __always_inline u64 effective_slack(const struct task_struct* p, struct task_ctx* tctx)
 {

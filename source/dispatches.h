@@ -54,6 +54,122 @@ static __always_inline void queue_on(u32 cpu, u64 now)
     dctx->last_progress = now;
 }
 
+// Claim an idle cpu @p may run on among the fast cpus (@fast) or the slower ones,
+// of a core whose other cpus are idle too if @whole_core. -1 if there is none.
+static __always_inline s32 claim_idle_of(const struct task_struct* p, bool fast, bool whole_core)
+{
+  u32 nr = fast ? nr_big_cpus : nr_little_cpus;
+  const struct cpumask* idle = whole_core ? scx_bpf_get_idle_smtmask() : scx_bpf_get_idle_cpumask();
+  s32 found = -1;
+  u32 i;
+
+  bpf_for(i, 0, nr)
+  {
+    u32 c = fast ? big_cpus[i & (MAX_CPUS - 1)] : little_cpus[i & (MAX_CPUS - 1)];
+    if (bpf_cpumask_test_cpu(c, idle) && bpf_cpumask_test_cpu(c, p->cpus_ptr) && scx_bpf_test_and_clear_cpu_idle(c))
+    {
+      found = c;
+      break;
+    }
+  }
+  scx_bpf_put_idle_cpumask(idle);
+  return found;
+}
+
+// Claim an idle cpu of the kind @p prefers (see wants_fast_core()), a whole idle
+// core first. -1 if there is none, or no fast and slower cores.
+static __always_inline s32 claim_idle_preferred(const struct task_struct* p, const struct task_ctx* tctx)
+{
+  if (!hybrid)
+    return -1;
+  bool fast = wants_fast_core(p, tctx);
+  if (!fast && !wants_slow_core(p, tctx))
+    return -1;
+  s32 cpu = smt ? claim_idle_of(p, fast, true) : -1;
+  return cpu >= 0 ? cpu : claim_idle_of(p, fast, false);
+}
+
+// Claim an idle cpu for @p, -1 if there is none. With SMT a cpu of a whole idle
+// core first: a cpu whose sibling is busy gets only part of the core. With fast
+// and slower cores those of the kind @p prefers first.
+static __always_inline s32 pick_idle(const struct task_struct* p, const struct task_ctx* tctx)
+{
+  s32 cpu = claim_idle_preferred(p, tctx);
+  if (cpu >= 0)
+    return cpu;
+  if (smt)
+  {
+    cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, SCX_PICK_IDLE_CORE);
+    if (cpu >= 0)
+      return cpu;
+  }
+  return scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
+}
+
+// Nothing is ahead of @p on its own @cpu, but an idle cpu elsewhere is better:
+// with SMT a whole idle core when the sibling of @cpu is busy, with fast and
+// slower cores a fast one when @p wants one and @cpu is slower. That cpu
+// (claimed), -1 if there is none.
+static __always_inline s32 better_idle(const struct task_struct* p, const struct task_ctx* tctx, u32 cpu)
+{
+  if (p->nr_cpus_allowed == 1)
+    return -1;
+  if (hybrid && cpu_cap(cpu) < 1024 && wants_fast_core(p, tctx))
+  {
+    s32 c = claim_idle_preferred(p, tctx);
+    if (c >= 0)
+      return c;
+  }
+  if (smt)
+  {
+    const struct cpumask* idle_cores = scx_bpf_get_idle_smtmask();
+    bool core_idle = bpf_cpumask_test_cpu(cpu, idle_cores);
+    scx_bpf_put_idle_cpumask(idle_cores);
+    if (!core_idle)
+      return scx_bpf_pick_idle_cpu(p->cpus_ptr, SCX_PICK_IDLE_CORE);
+  }
+  return -1;
+}
+
+// @p runs alone on @cpu (nothing queued there) at the end of its slice: an idle
+// cpu that is clearly better for it, claimed, or -1. With fast and slower cores
+// one of the kind it prefers when @cpu is the other kind; with SMT a cpu of a
+// whole idle core (of the same kind) when the other cpu of its own core is busy.
+// At most once per BALANCE_INTERVAL_NS per task.
+static __always_inline s32 better_cpu_alone(const struct task_struct* p, struct task_ctx* tctx, u32 cpu, u64 now)
+{
+  if (p->nr_cpus_allowed == 1 || is_migration_disabled(p) || now - tctx->last_migrated_at < BALANCE_INTERVAL_NS)
+    return -1;
+
+  bool on_fast = cpu_cap(cpu) >= 1024;
+  bool want_fast = on_fast;
+  if (hybrid)
+  {
+    bool fast = wants_fast_core(p, tctx);
+    if ((fast && !on_fast) || (wants_slow_core(p, tctx) && on_fast))
+    {
+      s32 c = claim_idle_preferred(p, tctx);
+      if (c >= 0)
+        return c;
+    }
+    if (fast || wants_slow_core(p, tctx))
+      want_fast = fast;
+  }
+
+  if (smt)
+  {
+    s32 sibling = cpu_sibling[cpu & (MAX_CPUS - 1)];
+    if (sibling < 0)
+      return -1;
+    const struct cpumask* idle = scx_bpf_get_idle_cpumask();
+    bool sibling_busy = !bpf_cpumask_test_cpu(sibling, idle);
+    scx_bpf_put_idle_cpumask(idle);
+    if (sibling_busy)
+      return hybrid ? claim_idle_of(p, want_fast, true) : scx_bpf_pick_idle_cpu(p->cpus_ptr, SCX_PICK_IDLE_CORE);
+  }
+  return -1;
+}
+
 // How much work would run on @cpu before a task with @deadline. @wakeup: the
 // task is woken up and may preempt.
 static __always_inline u64 cpu_load_ahead(u32 cpu, u64 deadline, bool wakeup)
@@ -129,6 +245,13 @@ static __always_inline u64 cpu_weight_load(u32 cpu, struct task_struct* self)
   return load;
 }
 
+// Weight load of @cpu (cpu_weight_load()) as if on a fast core: a slower core
+// gets through the same work in more time, so it counts heavier.
+static __always_inline u64 capacity_load(u64 load, u32 cpu)
+{
+  return hybrid ? load * 1024 / cpu_cap(cpu) : load;
+}
+
 // Cpu for a task that comes back after its slice: balanced by weight (see
 // RT_CPU_WEIGHT), at most once every BALANCE_INTERVAL_NS, unless its own cpu is
 // taken by an RT task.
@@ -137,7 +260,7 @@ static __always_inline s32 pick_balance_cpu(struct task_struct* p, struct task_c
   if (p->nr_cpus_allowed == 1)
     return cpu;
 
-  s32 idle = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
+  s32 idle = pick_idle(p, tctx);
   if (idle >= 0)
   {
     if ((u32)idle != cpu)
@@ -155,7 +278,7 @@ static __always_inline s32 pick_balance_cpu(struct task_struct* p, struct task_c
     return cpu;
 
   u64 margin = task_weight(p) / 2;
-  sc->best_load = cpu_weight_load(cpu, p);
+  sc->best_load = capacity_load(cpu_weight_load(cpu, p), cpu);
   sc->best = cpu;
   sc->sampled = 0;
   if (sc->best_load == 0)
@@ -175,7 +298,7 @@ static __always_inline s32 pick_balance_cpu(struct task_struct* p, struct task_c
     if (!bpf_cpumask_test_cpu(other, p->cpus_ptr))
       continue;
 
-    u64 load = cpu_weight_load(other, p);
+    u64 load = capacity_load(cpu_weight_load(other, p), other);
     if (load + margin < sc->best_load)
     {
       sc->best_load = load;
@@ -197,6 +320,12 @@ static __always_inline s32 pick_enqueue_cpu(struct task_struct* p, struct task_c
   u64 best_load = cpu_load_ahead(cpu, deadline, wakeup);
   if (best_load == 0)
   {
+    s32 better = better_idle(p, tctx, cpu);
+    if (better >= 0)
+    {
+      tctx->last_migrated_at = now;
+      return better;
+    }
     // Claim the cpu if it is idle, so no select_cpu() of another wakeup picks
     // it and puts its task into the local DSQ ahead of this one.
     scx_bpf_test_and_clear_cpu_idle(cpu);
@@ -206,7 +335,7 @@ static __always_inline s32 pick_enqueue_cpu(struct task_struct* p, struct task_c
   if (p->nr_cpus_allowed == 1)
     return cpu;
 
-  s32 idle = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
+  s32 idle = pick_idle(p, tctx);
   if (idle >= 0)
   {
     if ((u32)idle != cpu)
@@ -273,10 +402,9 @@ static __always_inline bool can_take(struct task_struct* p, u32 cpu)
   return !is_migration_disabled(p) && bpf_cpumask_test_cpu(cpu, p->cpus_ptr);
 }
 
-// Deadline of the first task in @dsq that @cpu may take (the queue is ordered by
-// deadline, so the earliest of them), DEADLINE_NONE if there is none among the
-// first STEAL_SCAN_DEPTH tasks.
-static __always_inline u64 dsq_first_takeable(u64 dsq, u32 cpu)
+// Deadline of the first task in @dsq that @cpu may take, DEADLINE_NONE if there
+// is none among the first @depth tasks.
+static __always_inline u64 dsq_first_takeable(u64 dsq, u32 cpu, u32 depth)
 {
   struct task_struct* p = dsq_first(dsq);
   u32 looked = 0;
@@ -290,14 +418,15 @@ static __always_inline u64 dsq_first_takeable(u64 dsq, u32 cpu)
   {
     if (can_take(p, cpu))
       return task_deadline(p);
-    if (++looked >= STEAL_SCAN_DEPTH)
+    if (++looked >= depth)
       break;
   }
   return DEADLINE_NONE;
 }
 
-// Move the first task in @dsq that @cpu may take to the local DSQ of @cpu.
-static __always_inline bool take_first_takeable(u64 dsq, u32 cpu)
+// Move the first task in @dsq that @cpu may take (among the first @depth) to the
+// local DSQ of @cpu.
+static __always_inline bool take_first_takeable(u64 dsq, u32 cpu, u32 depth)
 {
   struct task_struct* p;
   u32 looked = 0;
@@ -311,7 +440,7 @@ static __always_inline bool take_first_takeable(u64 dsq, u32 cpu)
       note_local(cpu, p);
       return true;
     }
-    if (++looked >= STEAL_SCAN_DEPTH)
+    if (++looked >= depth)
       break;
   }
   return false;
@@ -351,7 +480,7 @@ static __always_inline s32 find_earliest(u32 cpu, u32 mode, u64* deadline)
 
     if (mode == SCAN_STUCK_CPUS)
     {
-      if (!cpu_stuck(other, now))
+      if (!stuck_cpu[other & (MAX_CPUS - 1)] || !cpu_stuck(other, now))
         continue;
     }
     else
@@ -373,7 +502,8 @@ static __always_inline s32 find_earliest(u32 cpu, u32 mode, u64* deadline)
     if (!dsq_queued(dsq))
       continue;
 
-    u64 d = dsq_first_takeable(dsq, cpu);
+    bool rescue = mode == SCAN_STUCK_CPUS || mode == SCAN_RT_CPUS || mode == SCAN_RT_CPUS_OTHER_LLCS;
+    u64 d = dsq_first_takeable(dsq, cpu, rescue ? RESCUE_SCAN_DEPTH : STEAL_SCAN_DEPTH);
     if (d < sc->best_deadline)
     {
       sc->best_deadline = d;
@@ -383,6 +513,33 @@ static __always_inline s32 find_earliest(u32 cpu, u32 mode, u64* deadline)
 
   *deadline = sc->best_deadline;
   return sc->best_cpu;
+}
+
+// Every STUCK_CHECK_INTERVAL_NS one cpu (the first to get here) looks for stuck
+// cpus (see STUCK_NS) and marks them in stuck_cpu, nr_stuck_cpus tells the others
+// whether to look there: one scan of all cpus per interval for the whole system,
+// not one per cpu.
+static __always_inline void scan_stuck(u64 now)
+{
+  u64 last = stuck_scan_at;
+  if (elapsed(now, last) < STUCK_CHECK_INTERVAL_NS)
+    return;
+  if (__sync_val_compare_and_swap(&stuck_scan_at, last, now) != last)
+    return;
+
+  // Counted in the global, not a local: the verifier would track a local
+  // counter's exact value and go through the loop once per value.
+  u32 nr_cpu_ids = scx_bpf_nr_cpu_ids();
+  u32 i;
+  nr_stuck_cpus = 0;
+  bpf_for(i, 0, nr_cpu_ids)
+  {
+    u32 c = i & (MAX_CPUS - 1);
+    bool stuck = cpu_is_online(c) && cpu_stuck(c, now);
+    stuck_cpu[c] = stuck;
+    if (stuck)
+      nr_stuck_cpus++;
+  }
 }
 
 // Run a task of the own queue that is more than STARVE_GRACE_NS past its
@@ -434,7 +591,13 @@ static __always_inline bool take_overdue(struct dispatch_ctx* dctx, u64 dsq, u64
 // Busy cpus don't take tasks from each other, so tasks stay on their cpu (and
 // its caches). Tasks that keep running are balanced when they are queued again
 // after their slice (pick_enqueue_cpu()).
-static __always_inline bool dispatch_dsq_per_cpu(u32 cpu, u64 prev_key, u64 prev_deadline)
+//
+// Returns DSP_TOOK when a task was put into the local DSQ, DSP_PREV when prev
+// keeps running, DSP_NONE when there is nothing to run.
+#define DSP_TOOK 0
+#define DSP_PREV 1
+#define DSP_NONE 2
+static __always_inline u32 dispatch_dsq_per_cpu(u32 cpu, u64 prev_key, u64 prev_deadline)
 {
   u64 own_dsq = cpu_dsq(cpu);
   u64 own_key = dsq_head_key(own_dsq);
@@ -446,32 +609,32 @@ static __always_inline bool dispatch_dsq_per_cpu(u32 cpu, u64 prev_key, u64 prev
 
   struct dispatch_ctx* dctx = get_dispatch_ctx(cpu);
   u64 now = bpf_ktime_get_ns();
-  if (dctx && elapsed(now, dctx->last_stuck_check) >= STUCK_CHECK_INTERVAL_NS)
+  scan_stuck(now);
+  if (nr_stuck_cpus)
   {
-    dctx->last_stuck_check = now;
     other = find_earliest(cpu, SCAN_STUCK_CPUS, &deadline);
-    if (other >= 0 && deadline < local_best && take_first_takeable(cpu_dsq((u32)other), cpu))
-      return false;
+    if (other >= 0 && deadline < local_best && take_first_takeable(cpu_dsq((u32)other), cpu, RESCUE_SCAN_DEPTH))
+      return DSP_TOOK;
   }
 
   if (nr_rt_busy)
   {
     other = find_earliest(cpu, SCAN_RT_CPUS, &deadline);
-    if (other >= 0 && deadline < local_best && take_first_takeable(cpu_dsq((u32)other), cpu))
-      return false;
+    if (other >= 0 && deadline < local_best && take_first_takeable(cpu_dsq((u32)other), cpu, RESCUE_SCAN_DEPTH))
+      return DSP_TOOK;
     if (nr_llcs > 1)
     {
       other = find_earliest(cpu, SCAN_RT_CPUS_OTHER_LLCS, &deadline);
-      if (other >= 0 && deadline < local_best && take_first_takeable(cpu_dsq((u32)other), cpu))
-        return false;
+      if (other >= 0 && deadline < local_best && take_first_takeable(cpu_dsq((u32)other), cpu, RESCUE_SCAN_DEPTH))
+        return DSP_TOOK;
     }
   }
 
   if (take_overdue(dctx, own_dsq, now))
-    return false;
+    return DSP_TOOK;
 
   if (prev_key != DEADLINE_NONE && prev_key <= own_key)
-    return true;
+    return DSP_PREV;
   if (own_key != DEADLINE_NONE)
   {
     struct task_struct* head = dsq_first(own_dsq);
@@ -480,24 +643,24 @@ static __always_inline bool dispatch_dsq_per_cpu(u32 cpu, u64 prev_key, u64 prev
     {
       if (dctx)
         dctx->local_weight = w;
-      return false;
+      return DSP_TOOK;
     }
   }
   if (prev_key != DEADLINE_NONE)
-    return true;
+    return DSP_PREV;
 
   other = find_earliest(cpu, SCAN_OWN_LLC, &deadline);
-  if (other >= 0 && take_first_takeable(cpu_dsq((u32)other), cpu))
-    return false;
+  if (other >= 0 && take_first_takeable(cpu_dsq((u32)other), cpu, STEAL_SCAN_DEPTH))
+    return DSP_TOOK;
 
   if (nr_llcs > 1)
   {
     other = find_earliest(cpu, SCAN_OTHER_LLCS, &deadline);
-    if (other >= 0 && take_first_takeable(cpu_dsq((u32)other), cpu))
-      return false;
+    if (other >= 0 && take_first_takeable(cpu_dsq((u32)other), cpu, STEAL_SCAN_DEPTH))
+      return DSP_TOOK;
   }
 
-  return false;
+  return DSP_NONE;
 }
 
 // Wake an idle cpu for the first task waiting in the queue of @cpu, if it may run
@@ -508,7 +671,7 @@ static __always_inline void kick_idle_for_waiting(u32 cpu)
 
   if (p && p->nr_cpus_allowed > 1 && !is_migration_disabled(p))
   {
-    s32 idle = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
+    s32 idle = pick_idle(p, get_task_ctx(p));
     if (idle >= 0)
       scx_bpf_kick_cpu(idle, SCX_KICK_IDLE);
   }

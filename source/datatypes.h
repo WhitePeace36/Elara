@@ -20,6 +20,20 @@ const volatile u8 cpu_online[MAX_CPUS] = {};
 // evacuation of RT-taken cpus isn't needed.
 const volatile bool enq_immed = false;
 
+// Relative speed of each cpu (1024: the fastest), and the cpus by speed: the
+// fastest ones (big_cpus) and the slower ones (little_cpus, fastest first).
+// hybrid: there are slower ones (performance and efficiency cores). smt: a core
+// runs more than one cpu.
+const volatile u16 cpu_capacity[MAX_CPUS] = {};
+const volatile u16 big_cpus[MAX_CPUS] = {};
+const volatile u16 little_cpus[MAX_CPUS] = {};
+const volatile u32 nr_big_cpus = 0;
+const volatile u32 nr_little_cpus = 0;
+const volatile bool hybrid = false;
+const volatile bool smt = false;
+// another cpu of the same core, -1: none
+const volatile s32 cpu_sibling[MAX_CPUS] = {};
+
 struct task_ctx
 {
   // deadline in ns (see SLACK_NICE_0_NS) of the task in its queue, or of its
@@ -47,6 +61,9 @@ struct task_ctx
   u64 granted_slice;
   u64 resume_slice;
   u64 last_migrated_at;
+  // idle cpu (+1, 0: none) dispatch claimed for this task, which runs alone on a
+  // worse one (see better_cpu_alone())
+  u32 upmigrate_cpu;
 };
 
 struct dispatch_ctx
@@ -59,10 +76,8 @@ struct dispatch_ctx
   // last time this cpu looked for overdue tasks in its queue
   u64 last_starve_check;
   // last time a task started on this cpu or kept it for another slice, or its
-  // queue got its first task, and last time this cpu looked for stuck cpus
-  // (see STUCK_NS)
+  // queue got its first task (see STUCK_NS)
   u64 last_progress;
-  u64 last_stuck_check;
   // when the slice of the running task ends, and when the slice timer fires (0:
   // not set)
   u64 slice_end;
@@ -86,6 +101,12 @@ bool elara_ready;
 // Number of cpus an RT or deadline task runs on right now. Lets dispatch skip
 // looking for such cpus when there are none.
 u64 nr_rt_busy;
+
+// Stuck cpus (see STUCK_NS), found by one scan of all cpus every
+// STUCK_CHECK_INTERVAL_NS by whichever cpu gets to it first.
+u64 stuck_scan_at;
+u32 nr_stuck_cpus;
+u8 stuck_cpu[MAX_CPUS];
 
 struct pick_scratch
 {
