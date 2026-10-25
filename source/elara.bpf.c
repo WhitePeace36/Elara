@@ -180,6 +180,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(elara_init_task, struct task_struct* p, struct scx_
   tctx->vtime_cpu = VTIME_CPU_NONE;
   tctx->boost_slack = 0;
   tctx->boost_weight = 0;
+  tctx->boost_depth = 0;
   tctx->boost_used = 0;
   tctx->boost_limit = 0;
   tctx->boost_credit = WAKE_BOOST_BUDGET_NS;
@@ -196,6 +197,12 @@ void BPF_STRUCT_OPS(elara_exit_task, struct task_struct* p, struct scx_exit_task
 
 // Wake boost: a task woken by a task with a shorter slack takes over that slack
 // until it sleeps again, for a limited amount of cpu time.
+//
+// The waker passes on its own slack and weight, or, while it runs with a boost
+// itself that is less than WAKE_BOOST_CHAIN_MAX steps from the start of its
+// chain and not used up, that boost weakened by WAKE_BOOST_CHAIN_DECAY_NUM /
+// _DEN, if that is better. A chain started by a nice -5 task gets its slack
+// (~0.4ms) at the first step, then ~0.6, ~0.9 and ~1.35ms (nice 0: 3ms).
 static __always_inline void apply_wake_boost(struct task_struct* p, struct task_ctx* tctx)
 {
   if (!bpf_in_task())
@@ -207,9 +214,22 @@ static __always_inline void apply_wake_boost(struct task_struct* p, struct task_
   if (!WAKE_BOOST_FROM_KTHREADS && (waker->flags & PF_KTHREAD))
     return;
 
-  // The waker's own slack, not a boost it runs with itself: otherwise a boost
-  // passes on to everything the boosted task wakes, and from there on.
   u64 waker_slack = task_slack(waker);
+  u64 waker_weight = task_weight(waker);
+  u32 depth = 1;
+  struct task_ctx* wctx = get_task_ctx(waker);
+  if (wctx && wctx->boost_slack && wctx->boost_depth < WAKE_BOOST_CHAIN_MAX && !boost_spent(wctx))
+  {
+    u64 chain_slack = wctx->boost_slack * WAKE_BOOST_CHAIN_DECAY_NUM / WAKE_BOOST_CHAIN_DECAY_DEN;
+    if (chain_slack < waker_slack)
+    {
+      waker_slack = chain_slack;
+      u64 chain_weight = wctx->boost_weight * WAKE_BOOST_CHAIN_DECAY_DEN / WAKE_BOOST_CHAIN_DECAY_NUM;
+      waker_weight = chain_weight > waker_weight ? chain_weight : waker_weight;
+      depth = wctx->boost_depth + 1;
+    }
+  }
+
   if (waker_slack >= task_slack(p) || (tctx->boost_slack && waker_slack >= tctx->boost_slack))
     return;
 
@@ -218,7 +238,8 @@ static __always_inline void apply_wake_boost(struct task_struct* p, struct task_
     return;
 
   tctx->boost_slack = waker_slack;
-  tctx->boost_weight = task_weight(waker);
+  tctx->boost_weight = waker_weight;
+  tctx->boost_depth = depth;
   tctx->boost_used = 0;
   tctx->boost_limit = tctx->boost_credit < WAKE_BOOST_BUDGET_NS ? tctx->boost_credit : WAKE_BOOST_BUDGET_NS;
 }

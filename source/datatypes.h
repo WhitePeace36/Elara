@@ -33,6 +33,8 @@ struct task_ctx
   u64 boost_slack;
   // weight of the waker the boost came from (its cpu time is charged with it)
   u64 boost_weight;
+  // steps from the task the boost chain started at (1: woken by it directly)
+  u32 boost_depth;
   // cpu time used with the boost since the wakeup that boosted it, and how much
   // of it that boost may use (WAKE_BOOST_BUDGET_NS, less when the credit is low)
   u64 boost_used;

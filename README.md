@@ -160,12 +160,12 @@ slice if its new key is not later than the key of the first queued task.
 ## Wake boost
 
 When a task wakes a task with a longer slack, the woken task takes over the slack of the
-waker until it goes to sleep again, for at most 4ms of cpu time (`WAKE_BOOST_BUDGET_NS`).
+waker until it goes to sleep again, for at most 8ms of cpu time (`WAKE_BOOST_BUDGET_NS`).
 That way work a task waits for (a helper thread, wineserver, a kworker that submits its
 gpu job, ...) runs right away instead of behind everything in between.
 
 The boosted cpu time of a task is also limited over time: each task has a credit of at
-most 4ms that refills at 4ms per 20ms (`WAKE_BOOST_WINDOW_NS`), so at most a fifth of a
+most 8ms that refills at 8ms per 20ms (`WAKE_BOOST_WINDOW_NS`), so at most two fifths of a
 core. A boost gets at most what is left of the credit, and with less than 250us left
 (`WAKE_BOOST_MIN_NS`) there is no boost.
 
@@ -173,10 +173,27 @@ While boosted, the cpu time of the task is charged to its vtime with the weight 
 waker, not its own. Otherwise a light task (a nice 0 audio client woken by a nice -12
 audio server) would use up its turn within its first slice and then wait behind every
 task of a higher weight anyway: under a nice -5 load on every core such a client doing
-1.5ms of work every 5ms missed its deadline 1390 of 1600 times, now 333 (EEVDF: 604).
+1.5ms of work every 5ms missed its deadline 1390 of 1600 times, ~300 with this and a
+credit of 4ms per 20ms, 5-18 with 8ms per 20ms (EEVDF: ~600).
 
-The waker's own slack counts, not a slack it runs with because it was boosted itself.
-Otherwise a boost would pass on to everything the boosted task wakes, and from there on.
+A boosted task passes its boost on to the tasks it wakes, a bit weaker at every step
+(1.5 times the slack and 1/1.5 of the weight, `WAKE_BOOST_CHAIN_DECAY_NUM` / `_DEN`) and
+for at most 4 steps from the task the chain started at (`WAKE_BOOST_CHAIN_MAX`). So a
+whole chain of wakeups keeps moving, not just its first step: behind a nice -5 game the
+nice 0 stages of a chain get ~0.4, ~0.6, ~0.9 and ~1.35ms of slack instead of 3ms. A step
+only passes on what is better than the waker's own slack, and the credit limits every
+task of the chain on its own. Without the limit a boost would pass on to everything a
+boosted task wakes, and from there on.
+
+Under a nice -5 load on every core, a nice -5 task that starts a chain of nice 0 stages
+(0.2-0.3ms of work each) every 5ms missed the period this often out of 1600:
+
+| stages | one step only | chain | EEVDF |
+|---|---|---|---|
+| 2 | 386-440 | 3-7 | 127-132 |
+| 3 | 772-832 | 17-29 | 415-495 |
+| 4 | 906-1015 | 32-67 | 501-506 |
+| 2, 1ms of work each | 1237-1247 | 28-41 | 534-553 |
 
 Only wakeups from normal task context count. A wakeup from an interrupt runs on top of
 whatever task was interrupted, and that task is not the waker. Wakeups by kernel threads

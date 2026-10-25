@@ -126,8 +126,12 @@
 
 // CPU time a woken task keeps the slack of its waker for, as long as it doesn't
 // sleep before. Covers work that needs a few slices, without letting a task that
-// keeps running stay ahead of everything.
-#define WAKE_BOOST_BUDGET_NS (4ULL * NS_PER_MS)
+// keeps running stay ahead of everything. With 4ms (a fifth of a core, see
+// WAKE_BOOST_WINDOW_NS) a chain of two nice 0 stages doing 1ms each every 5ms
+// behind a nice -5 task under game load used up its credit and missed 146-184 of
+// 1600 periods (p99 40ms), with 8ms 28-41 (p99 6ms); an audio client doing 1.5ms
+// every 5ms missed ~300, with 8ms 5-18.
+#define WAKE_BOOST_BUDGET_NS (8ULL * NS_PER_MS)
 
 // A task can't use more than WAKE_BOOST_BUDGET_NS of boosted cpu time per
 // WAKE_BOOST_WINDOW_NS, however often it is woken: the credit for it refills at
@@ -137,6 +141,20 @@
 // No boost when less credit than this is left: it would end before the task got
 // anything done.
 #define WAKE_BOOST_MIN_NS (250ULL * NS_PER_US)
+
+// A boosted task passes its boost on to the tasks it wakes, so a chain of
+// wakeups (game -> audio client -> audio server, a request through several
+// helper processes) keeps moving, not just its first step. Each step passes on
+// a bit less (the slack times WAKE_BOOST_CHAIN_DECAY_NUM / _DEN, the weight
+// divided by it), and only up to WAKE_BOOST_CHAIN_MAX steps away from the task
+// the chain started at: without a limit a boost spreads to everything a boosted
+// task wakes, and from there on. The credit limits each task of a chain on its
+// own. With a factor of 2 per step a chain of four nice 0 stages behind a nice
+// -5 task missed its 5ms period 620 of 1600 times under game load (EEVDF 500),
+// with 1.5 25 times.
+#define WAKE_BOOST_CHAIN_MAX 4
+#define WAKE_BOOST_CHAIN_DECAY_NUM 3
+#define WAKE_BOOST_CHAIN_DECAY_DEN 2
 
 // ---------------------------------------------------------------------------
 // Realtime

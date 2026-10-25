@@ -198,8 +198,8 @@ static __always_inline void rebase_vtime(struct task_ctx* tctx, u32 cpu, s64 lag
 // with the weight of the waker: the woken task does the waker's work, and
 // charged with its own weight a light task (a nice 0 audio client woken by a
 // nice -12 audio server) used up its turn in the first slice and then waited
-// behind everything of higher weight anyway. The boost credit limits this to a
-// fifth of a core.
+// behind everything of higher weight anyway. The boost credit limits this to
+// two fifths of a core.
 static __always_inline void charge_vtime(const struct task_struct* p, struct task_ctx* tctx, u64 used)
 {
   u64 w = task_weight(p);
