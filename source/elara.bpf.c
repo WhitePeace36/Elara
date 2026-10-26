@@ -322,6 +322,11 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
       scx_bpf_kick_cpu(up - 1, SCX_KICK_IDLE);
       return;
     }
+    // It can't go there any more (its affinity changed or the cpu went
+    // offline): the cpu claimed for it stays idle, kicked so it counts as idle
+    // again.
+    if (up)
+      scx_bpf_kick_cpu(up - 1, SCX_KICK_IDLE);
     scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SLICE_NS, enq_flags);
     return;
   }
@@ -594,6 +599,11 @@ void BPF_STRUCT_OPS(elara_running, struct task_struct* p)
     scx_bpf_task_set_slice(p, SLICE_NS);
 
   context->started_at = bpf_ktime_get_ns();
+  // A cpu dispatch claimed for it that it didn't go to (the kernel put it back
+  // without enqueue(), see SCX_EV_ENQ_SKIP_EXITING) stays idle: kicked so it
+  // counts as idle again.
+  if (context->upmigrate_cpu && context->upmigrate_cpu - 1 != cpu)
+    scx_bpf_kick_cpu(context->upmigrate_cpu - 1, SCX_KICK_IDLE);
   context->upmigrate_cpu = 0;
   context->granted_slice = p->scx.slice;
   context->resume_slice = 0;
