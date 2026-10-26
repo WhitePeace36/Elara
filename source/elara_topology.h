@@ -264,6 +264,16 @@ bool setup_elara_topology(Skel* skel, const std::filesystem::path& cpu_root = "/
     skel->rodata->big_cpus[i] = static_cast<std::uint16_t>(big[i]);
   for (std::uint32_t i = 0; i < little.size(); ++i)
     skel->rodata->little_cpus[i] = static_cast<std::uint16_t>(little[i]);
+  // The cpus of each llc, one llc after the other.
+  std::uint32_t pos = 0;
+  for (std::uint32_t llc = 0; llc < topo->nr_llcs; ++llc)
+  {
+    skel->rodata->llc_start[llc] = static_cast<std::uint16_t>(pos);
+    for (std::uint32_t cpu = 0; cpu < topo->nr_cpu_ids; ++cpu)
+      if (topo->cpu_online[cpu] && topo->cpu_to_llc[cpu] == llc)
+        skel->rodata->llc_cpus[pos++] = static_cast<std::uint16_t>(cpu);
+    skel->rodata->llc_len[llc] = static_cast<std::uint16_t>(pos - skel->rodata->llc_start[llc]);
+  }
   skel->rodata->nr_big_cpus = static_cast<std::uint32_t>(big.size());
   skel->rodata->nr_little_cpus = static_cast<std::uint32_t>(little.size());
   skel->rodata->hybrid = !little.empty();

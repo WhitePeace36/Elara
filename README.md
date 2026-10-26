@@ -233,12 +233,14 @@ Offline cores (for example the second threads with SMT off) are never used.
 ### SMT
 
 With SMT (two cpus per core) a cpu whose sibling is busy gets only part of the core.
-So wherever elara picks an idle cpu itself, a cpu of a whole idle core comes first, and
-only then any idle cpu. A woken task whose own cpu is free but whose sibling is busy
-moves to a whole idle core if there is one. A task that keeps running alone on a cpu
-whose sibling is busy moves to a whole idle core at the end of its slice (at most once
-every 10ms): an idle cpu can't take over a running task itself, so dispatch doesn't
-extend its slice and the kernel hands it back to enqueue() (`SCX_OPS_ENQ_LAST`, only
+So wherever elara picks an idle cpu itself, a cpu of a whole idle core comes first (of
+the task's own llc, then any), and only then any idle cpu (again of the own llc first),
+the order of the kernel's default. A woken task whose own cpu is free but whose sibling
+is busy moves to a whole idle core of the same llc if there is one: in another llc it
+would start with a cold cache, which costs more than sharing the core. For the same
+reason a task that keeps running alone on a cpu whose sibling is busy moves to a whole
+idle core of the same llc at the end of its slice (at most once every 10ms): an idle
+cpu can't take over a running task itself, so dispatch doesn't extend its slice and the kernel hands it back to enqueue() (`SCX_OPS_ENQ_LAST`, only
 set with SMT or fast and slower cores), which puts it there.
 
 ### Fast and slower cores

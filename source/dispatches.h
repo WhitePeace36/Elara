@@ -76,6 +76,30 @@ static __always_inline s32 claim_idle_of(const struct task_struct* p, bool fast,
   return found;
 }
 
+// Claim an idle cpu @p may run on in @llc, of a core whose other cpus are idle
+// too if @whole_core. -1 if there is none.
+static __always_inline s32 claim_idle_in_llc(const struct task_struct* p, u32 llc, bool whole_core)
+{
+  llc &= (MAX_CPUS - 1);
+  u32 start = llc_start[llc];
+  u32 nr = llc_len[llc];
+  const struct cpumask* idle = whole_core ? scx_bpf_get_idle_smtmask() : scx_bpf_get_idle_cpumask();
+  s32 found = -1;
+  u32 i;
+
+  bpf_for(i, 0, nr)
+  {
+    u32 c = llc_cpus[(start + i) & (MAX_CPUS - 1)];
+    if (bpf_cpumask_test_cpu(c, idle) && bpf_cpumask_test_cpu(c, p->cpus_ptr) && scx_bpf_test_and_clear_cpu_idle(c))
+    {
+      found = c;
+      break;
+    }
+  }
+  scx_bpf_put_idle_cpumask(idle);
+  return found;
+}
+
 // Claim an idle cpu of the kind @p prefers (see wants_fast_core()), a whole idle
 // core first. -1 if there is none, or no fast and slower cores.
 static __always_inline s32 claim_idle_preferred(const struct task_struct* p, const struct task_ctx* tctx)
@@ -89,25 +113,38 @@ static __always_inline s32 claim_idle_preferred(const struct task_struct* p, con
   return cpu >= 0 ? cpu : claim_idle_of(p, fast, false);
 }
 
-// Claim an idle cpu for @p, -1 if there is none. With SMT a cpu of a whole idle
-// core first: a cpu whose sibling is busy gets only part of the core. With fast
-// and slower cores those of the kind @p prefers first.
-static __always_inline s32 pick_idle(const struct task_struct* p, const struct task_ctx* tctx)
+// Claim an idle cpu for @p, whose cpu is @cpu, -1 if there is none. With fast
+// and slower cores those of the kind @p prefers first. With SMT a cpu of a whole
+// idle core (a cpu whose sibling is busy gets only part of the core), of the llc
+// of @cpu first, then any; then any idle cpu, of the llc of @cpu first: in
+// another llc the task starts with a cold cache. The order of the kernel's
+// default (scx_select_cpu_dfl()).
+static __always_inline s32 pick_idle(const struct task_struct* p, const struct task_ctx* tctx, u32 cpu)
 {
-  s32 cpu = claim_idle_preferred(p, tctx);
-  if (cpu >= 0)
-    return cpu;
+  s32 c = claim_idle_preferred(p, tctx);
+  if (c >= 0)
+    return c;
   if (smt)
   {
-    cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, SCX_PICK_IDLE_CORE);
-    if (cpu >= 0)
-      return cpu;
+    c = claim_idle_in_llc(p, cpu_llc_id(cpu), true);
+    if (c >= 0)
+      return c;
+    c = scx_bpf_pick_idle_cpu(p->cpus_ptr, SCX_PICK_IDLE_CORE);
+    if (c >= 0)
+      return c;
+  }
+  if (nr_llcs > 1)
+  {
+    c = claim_idle_in_llc(p, cpu_llc_id(cpu), false);
+    if (c >= 0)
+      return c;
   }
   return scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
 }
 
 // Nothing is ahead of @p on its own @cpu, but an idle cpu elsewhere is better:
-// with SMT a whole idle core when the sibling of @cpu is busy, with fast and
+// with SMT a whole idle core of the same llc when the sibling of @cpu is busy
+// (another llc costs the cache, more than sharing the core), with fast and
 // slower cores a fast one when @p wants one and @cpu is slower. That cpu
 // (claimed), -1 if there is none.
 static __always_inline s32 better_idle(const struct task_struct* p, const struct task_ctx* tctx, u32 cpu)
@@ -126,7 +163,7 @@ static __always_inline s32 better_idle(const struct task_struct* p, const struct
     bool core_idle = bpf_cpumask_test_cpu(cpu, idle_cores);
     scx_bpf_put_idle_cpumask(idle_cores);
     if (!core_idle)
-      return scx_bpf_pick_idle_cpu(p->cpus_ptr, SCX_PICK_IDLE_CORE);
+      return claim_idle_in_llc(p, cpu_llc_id(cpu), true);
   }
   return -1;
 }
@@ -134,7 +171,8 @@ static __always_inline s32 better_idle(const struct task_struct* p, const struct
 // @p runs alone on @cpu (nothing queued there) at the end of its slice: an idle
 // cpu that is clearly better for it, claimed, or -1. With fast and slower cores
 // one of the kind it prefers when @cpu is the other kind; with SMT a cpu of a
-// whole idle core (of the same kind) when the other cpu of its own core is busy.
+// whole idle core (of the same kind, without those: of the same llc) when the
+// other cpu of its own core is busy.
 // At most once per BALANCE_INTERVAL_NS per task.
 static __always_inline s32 better_cpu_alone(const struct task_struct* p, struct task_ctx* tctx, u32 cpu, u64 now)
 {
@@ -165,7 +203,7 @@ static __always_inline s32 better_cpu_alone(const struct task_struct* p, struct 
     bool sibling_busy = !bpf_cpumask_test_cpu(sibling, idle);
     scx_bpf_put_idle_cpumask(idle);
     if (sibling_busy)
-      return hybrid ? claim_idle_of(p, want_fast, true) : scx_bpf_pick_idle_cpu(p->cpus_ptr, SCX_PICK_IDLE_CORE);
+      return hybrid ? claim_idle_of(p, want_fast, true) : claim_idle_in_llc(p, cpu_llc_id(cpu), true);
   }
   return -1;
 }
@@ -260,7 +298,7 @@ static __always_inline s32 pick_balance_cpu(struct task_struct* p, struct task_c
   if (p->nr_cpus_allowed == 1)
     return cpu;
 
-  s32 idle = pick_idle(p, tctx);
+  s32 idle = pick_idle(p, tctx, cpu);
   if (idle >= 0)
   {
     if ((u32)idle != cpu)
@@ -335,7 +373,7 @@ static __always_inline s32 pick_enqueue_cpu(struct task_struct* p, struct task_c
   if (p->nr_cpus_allowed == 1)
     return cpu;
 
-  s32 idle = pick_idle(p, tctx);
+  s32 idle = pick_idle(p, tctx, cpu);
   if (idle >= 0)
   {
     if ((u32)idle != cpu)
@@ -671,7 +709,7 @@ static __always_inline void kick_idle_for_waiting(u32 cpu)
 
   if (p && p->nr_cpus_allowed > 1 && !is_migration_disabled(p))
   {
-    s32 idle = pick_idle(p, get_task_ctx(p));
+    s32 idle = pick_idle(p, get_task_ctx(p), cpu);
     if (idle >= 0)
       scx_bpf_kick_cpu(idle, SCX_KICK_IDLE);
   }

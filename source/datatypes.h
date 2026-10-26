@@ -33,6 +33,10 @@ const volatile bool hybrid = false;
 const volatile bool smt = false;
 // another cpu of the same core, -1: none
 const volatile s32 cpu_sibling[MAX_CPUS] = {};
+// the cpus of llc n: llc_cpus[llc_start[n]] and the llc_len[n] - 1 after it
+const volatile u16 llc_cpus[MAX_CPUS] = {};
+const volatile u16 llc_start[MAX_CPUS] = {};
+const volatile u16 llc_len[MAX_CPUS] = {};
 
 struct task_ctx
 {
