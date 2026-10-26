@@ -273,7 +273,7 @@ s32 BPF_STRUCT_OPS(elara_select_cpu, struct task_struct* p, s32 prev_cpu, u64 wa
   if (hybrid && tctx && p->nr_cpus_allowed > 1)
   {
     bool fast = wants_fast_core(p, tctx);
-    if ((fast || wants_slow_core(p, tctx)) && (cpu_cap(prev_cpu) >= 1024) == fast && bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
+    if ((fast || wants_slow_core(p, tctx)) && cpu_is_fast(prev_cpu) == fast && bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
         scx_bpf_test_and_clear_cpu_idle(prev_cpu))
       cpu = prev_cpu;
     else

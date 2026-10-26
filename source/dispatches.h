@@ -151,7 +151,7 @@ static __always_inline s32 better_idle(const struct task_struct* p, const struct
 {
   if (p->nr_cpus_allowed == 1)
     return -1;
-  if (hybrid && cpu_cap(cpu) < 1024 && wants_fast_core(p, tctx))
+  if (hybrid && !cpu_is_fast(cpu) && wants_fast_core(p, tctx))
   {
     s32 c = claim_idle_preferred(p, tctx);
     if (c >= 0)
@@ -179,7 +179,7 @@ static __always_inline s32 better_cpu_alone(const struct task_struct* p, struct 
   if (p->nr_cpus_allowed == 1 || is_migration_disabled(p) || now - tctx->last_migrated_at < BALANCE_INTERVAL_NS)
     return -1;
 
-  bool on_fast = cpu_cap(cpu) >= 1024;
+  bool on_fast = cpu_is_fast(cpu);
   bool want_fast = on_fast;
   if (hybrid)
   {

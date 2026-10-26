@@ -25,6 +25,8 @@ const volatile bool enq_immed = false;
 // hybrid: there are slower ones (performance and efficiency cores). smt: a core
 // runs more than one cpu.
 const volatile u16 cpu_capacity[MAX_CPUS] = {};
+// the cpu is one of the fast ones (in big_cpus)
+const volatile u8 cpu_fast[MAX_CPUS] = {};
 const volatile u16 big_cpus[MAX_CPUS] = {};
 const volatile u16 little_cpus[MAX_CPUS] = {};
 const volatile u32 nr_big_cpus = 0;

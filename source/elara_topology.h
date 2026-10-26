@@ -208,6 +208,10 @@ inline std::optional<Topology> read_topology(const fs::path& cpu_root = "/sys/de
 
 }  // namespace elara
 
+// A core counts as slower (an efficiency core) when its capacity is below this
+// percentage of the fastest one.
+constexpr std::uint32_t SLOW_CORE_PERCENT = 85;
+
 template <typename Skel>
 bool setup_elara_topology(Skel* skel, const std::filesystem::path& cpu_root = "/sys/devices/system/cpu")
 {
@@ -250,18 +254,24 @@ bool setup_elara_topology(Skel* skel, const std::filesystem::path& cpu_root = "/
     }
   }
 
-  // Cores slower than the fastest ones (efficiency cores) and the fastest ones,
-  // each list sorted by capacity, fastest first.
+  // Cores clearly slower than the fastest ones (efficiency cores) and the fast
+  // ones, each list sorted by capacity, fastest first. "Clearly": performance
+  // cores differ a little too (intel_pstate reports the favored cores of Turbo
+  // Boost Max 3.0 a few percent higher), those are still fast cores.
   std::vector<std::uint32_t> big, little;
   for (std::uint32_t cpu = 0; cpu < topo->nr_cpu_ids; ++cpu)
   {
     if (!topo->cpu_online[cpu])
       continue;
-    (topo->cpu_capacity[cpu] < cap_max ? little : big).push_back(cpu);
+    (topo->cpu_capacity[cpu] * 100 < cap_max * SLOW_CORE_PERCENT ? little : big).push_back(cpu);
   }
+  std::stable_sort(big.begin(), big.end(), [&](std::uint32_t a, std::uint32_t b) { return topo->cpu_capacity[a] > topo->cpu_capacity[b]; });
   std::stable_sort(little.begin(), little.end(), [&](std::uint32_t a, std::uint32_t b) { return topo->cpu_capacity[a] > topo->cpu_capacity[b]; });
   for (std::uint32_t i = 0; i < big.size(); ++i)
+  {
     skel->rodata->big_cpus[i] = static_cast<std::uint16_t>(big[i]);
+    skel->rodata->cpu_fast[big[i]] = 1;
+  }
   for (std::uint32_t i = 0; i < little.size(); ++i)
     skel->rodata->little_cpus[i] = static_cast<std::uint16_t>(little[i]);
   // The cpus of each llc, one llc after the other.

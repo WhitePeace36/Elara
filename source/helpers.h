@@ -254,6 +254,13 @@ static __always_inline u32 cpu_cap(u32 cpu)
   return cap ? cap : 1024;
 }
 
+// @cpu is one of the fast cpus (see big_cpus).
+static __always_inline bool cpu_is_fast(u32 cpu)
+{
+  cpu &= (MAX_CPUS - 1);
+  return cpu_fast[cpu];
+}
+
 // With fast and slower cores: tasks more important than nice 0 (a lower nice
 // value, or a wake boost from such a task) go to the fast cores first, tasks
 // less important than nice 0 to the slower ones. Nice 0 takes any.

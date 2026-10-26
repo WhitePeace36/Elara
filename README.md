@@ -245,8 +245,9 @@ set with SMT or fast and slower cores), which puts it there.
 
 ### Fast and slower cores
 
-On cpus with performance and efficiency cores (`cpu_capacity` in sysfs below the
-fastest one), tasks more important than nice 0 (a lower nice value, or a wake boost
+On cpus with performance and efficiency cores (`cpu_capacity` in sysfs more than 15%
+below the fastest one; performance cores that differ by a few percent, like the
+favored cores of Intel's Turbo Boost Max 3.0, all count as fast), tasks more important than nice 0 (a lower nice value, or a wake boost
 from such a task) go to idle fast cores first, tasks less important than nice 0 to idle
 slower ones first, nice 0 takes any. A task that runs alone on a core of the other kind
 while one of its kind is idle moves there at the end of its slice, the same way as with

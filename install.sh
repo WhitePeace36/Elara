@@ -36,7 +36,7 @@ run_step "Install binary to /usr/local/bin"   sudo cp build/elara /usr/local/bin
 run_step "Install service unit"               sudo cp elara.service /etc/systemd/system/
 run_step "Reload systemd units"               sudo systemctl daemon-reload
 run_step "Enable and start elara.service"     sudo systemctl enable --now elara.service
-run_step "Check elara.service status"         sudo systemctl status elara.service
+run_step "Check elara.service status"         sudo systemctl --no-pager status elara.service
 
 echo "${GREEN}All steps completed successfully.${RESET}"
 
