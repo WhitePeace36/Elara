@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <climits>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -25,6 +26,7 @@ struct Topology
   std::vector<std::uint32_t> cpu_capacity;  // nr_cpu_ids entries, 1024 = fastest core
   std::vector<std::int32_t> cpu_sibling;    // nr_cpu_ids entries, another cpu of the same core, -1: none
   bool smt = false;                         // a core runs more than one cpu
+  bool capacity_from_core_types = false;    // capacities from the Intel core types (see intel_hybrid_capacity())
 };
 
 namespace detail
@@ -139,9 +141,123 @@ inline std::optional<std::string> cache_group_key(const fs::path& cpu_dir, long 
   return std::nullopt;
 }
 
+// kHz per HWP performance unit of a performance core, the "hybrid scaling factor"
+// of intel_pstate (an efficiency core's unit is 100000 kHz). By model, from
+// /proc/cpuinfo; models the kernel doesn't list get about the same.
+inline std::uint32_t intel_pcore_scaling(const fs::path& cpuinfo)
+{
+  std::ifstream in(cpuinfo);
+  std::string line;
+  long family = -1, model = -1;
+  while ((family < 0 || model < 0) && std::getline(in, line))
+  {
+    const auto colon = line.find(':');
+    if (colon == std::string::npos)
+      continue;
+    std::string key = line.substr(0, colon);
+    while (!key.empty() && (key.back() == ' ' || key.back() == '\t'))
+      key.pop_back();
+    try
+    {
+      if (key == "cpu family")
+        family = std::stol(line.substr(colon + 1));
+      else if (key == "model")
+        model = std::stol(line.substr(colon + 1));
+    }
+    catch (...)
+    {
+    }
+  }
+  if (family == 6)
+  {
+    switch (model)
+    {
+      case 0x97:  // Alder Lake
+      case 0x9a:  // Alder Lake L
+      case 0xb7:  // Raptor Lake
+      case 0xba:  // Raptor Lake P
+      case 0xbf:  // Raptor Lake S
+      case 0xd7:  // Bartlett Lake
+        return 78741;
+      case 0xaa:  // Meteor Lake L
+        return 80000;
+      case 0xbd:  // Lunar Lake M
+        return 86957;
+    }
+  }
+  return 80000;
+}
+
+// Intel cpus with performance and efficiency cores and Hyper-Threading (12th to
+// 14th gen, Meteor Lake): the kernel only reports core capacities with SMT off
+// (intel_pstate), so all cores look equally fast. The perf driver tells the core
+// types apart (a PMU per type: cpu_core, cpu_atom, cpu_lowpower for the low power
+// efficiency cores of Meteor Lake). The capacities are then worked out the way
+// intel_pstate does: HWP performance units at the highest frequency, where a unit
+// of a performance core is worth intel_pcore_scaling() kHz and one of an
+// efficiency core 100000 kHz.
+inline void intel_hybrid_capacity(Topology& topo, const fs::path& cpu_root, const fs::path& devices_root, const fs::path& cpuinfo)
+{
+  // Capacities from the kernel are better (and differ only on such cpus).
+  std::uint32_t cap_min = UINT32_MAX, cap_max = 0;
+  for (std::uint32_t cpu = 0; cpu < topo.nr_cpu_ids; ++cpu)
+    if (topo.cpu_online[cpu])
+    {
+      cap_min = std::min(cap_min, topo.cpu_capacity[cpu]);
+      cap_max = std::max(cap_max, topo.cpu_capacity[cpu]);
+    }
+  if (cap_min != cap_max)
+    return;
+
+  const auto pcores = read_cpulist_file(devices_root / "cpu_core" / "cpus");
+  if (!pcores || pcores->empty())
+    return;
+  std::vector<bool> is_pcore(topo.nr_cpu_ids, false), is_ecore(topo.nr_cpu_ids, false);
+  for (const auto cpu : *pcores)
+    if (cpu < topo.nr_cpu_ids)
+      is_pcore[cpu] = true;
+  bool any_ecore = false;
+  for (const char* pmu : {"cpu_atom", "cpu_lowpower"})
+    if (const auto ecores = read_cpulist_file(devices_root / pmu / "cpus"))
+      for (const auto cpu : *ecores)
+        if (cpu < topo.nr_cpu_ids && topo.cpu_online[cpu] && !is_pcore[cpu])
+          is_ecore[cpu] = any_ecore = true;
+  if (!any_ecore)
+    return;
+
+  // Highest frequency in kHz (0: unknown), the highest of the performance cores.
+  auto max_freq = [&](std::uint32_t cpu) { return read_long_file(cpu_root / ("cpu" + std::to_string(cpu)) / "cpufreq" / "cpuinfo_max_freq").value_or(0); };
+  long pcore_freq = 0;
+  for (std::uint32_t cpu = 0; cpu < topo.nr_cpu_ids; ++cpu)
+    if (topo.cpu_online[cpu] && is_pcore[cpu])
+      pcore_freq = std::max(pcore_freq, max_freq(cpu));
+  const std::uint64_t scaling = intel_pcore_scaling(cpuinfo);
+
+  for (std::uint32_t cpu = 0; cpu < topo.nr_cpu_ids; ++cpu)
+  {
+    if (!topo.cpu_online[cpu] || (!is_pcore[cpu] && !is_ecore[cpu]))
+      continue;
+    const long freq = max_freq(cpu);
+    // Relative to the fastest performance core: same unit for performance cores,
+    // a unit of an efficiency core is worth 100000 / scaling of theirs. Without
+    // frequencies, as fast as a performance core per MHz.
+    const std::uint64_t ratio_1024 = pcore_freq > 0 && freq > 0 ? static_cast<std::uint64_t>(freq) * 1024 / static_cast<std::uint64_t>(pcore_freq) : 1024;
+    std::uint64_t cap = is_pcore[cpu] ? ratio_1024 : ratio_1024 * scaling / 100000;
+    // An efficiency core always counts as one (see SLOW_CORE_PERCENT), whatever the
+    // frequencies say; a performance core never as one.
+    if (is_ecore[cpu])
+      cap = std::min<std::uint64_t>(cap, 1024 * 80 / 100);
+    else
+      cap = std::max<std::uint64_t>(cap, 1024 * 90 / 100);
+    topo.cpu_capacity[cpu] = static_cast<std::uint32_t>(std::max<std::uint64_t>(std::min<std::uint64_t>(cap, 1024), 1));
+  }
+  topo.capacity_from_core_types = true;
+}
+
 }  // namespace detail
 
-inline std::optional<Topology> read_topology(const fs::path& cpu_root = "/sys/devices/system/cpu")
+inline std::optional<Topology> read_topology(const fs::path& cpu_root = "/sys/devices/system/cpu", const fs::path& devices_root = "/sys/devices",
+                                             const fs::path& cpuinfo = "/proc/cpuinfo")
 {
   using namespace detail;
 
@@ -203,6 +319,7 @@ inline std::optional<Topology> read_topology(const fs::path& cpu_root = "/sys/de
   }
 
   topo.nr_llcs = static_cast<std::uint32_t>(group_to_dense.size());
+  intel_hybrid_capacity(topo, cpu_root, devices_root, cpuinfo);
   return topo;
 }
 
@@ -213,9 +330,10 @@ inline std::optional<Topology> read_topology(const fs::path& cpu_root = "/sys/de
 constexpr std::uint32_t SLOW_CORE_PERCENT = 85;
 
 template <typename Skel>
-bool setup_elara_topology(Skel* skel, const std::filesystem::path& cpu_root = "/sys/devices/system/cpu")
+bool setup_elara_topology(Skel* skel, const std::filesystem::path& cpu_root = "/sys/devices/system/cpu", const std::filesystem::path& devices_root = "/sys/devices",
+                          const std::filesystem::path& cpuinfo = "/proc/cpuinfo")
 {
-  const auto topo = elara::read_topology(cpu_root);
+  const auto topo = elara::read_topology(cpu_root, devices_root, cpuinfo);
   if (!topo)
   {
     return false;
@@ -296,7 +414,8 @@ bool setup_elara_topology(Skel* skel, const std::filesystem::path& cpu_root = "/
   }
 
   std::cerr << "elara: topology: " << topo->nr_cpu_ids << " cpu ids (" << nr_online << " online), " << topo->nr_llcs << " llc domain(s), smt "
-            << (topo->smt ? "on" : "off") << ", " << (little.empty() ? "all cores equally fast" : std::to_string(big.size()) + " fast and " + std::to_string(little.size()) + " slower cores") << "\n";
+            << (topo->smt ? "on" : "off") << ", " << (little.empty() ? "all cores equally fast" : std::to_string(big.size()) + " fast and " + std::to_string(little.size()) + " slower cores")
+            << (topo->capacity_from_core_types ? " (capacities from the Intel core types)" : "") << "\n";
   for (std::uint32_t cpu = 0; cpu < topo->nr_cpu_ids; ++cpu)
   {
     if (topo->cpu_online[cpu])

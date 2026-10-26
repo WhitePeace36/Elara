@@ -247,9 +247,17 @@ set with SMT or fast and slower cores), which puts it there.
 
 On cpus with performance and efficiency cores (`cpu_capacity` in sysfs more than 15%
 below the fastest one; performance cores that differ by a few percent, like the
-favored cores of Intel's Turbo Boost Max 3.0, all count as fast), tasks more important than nice 0 (a lower nice value, or a wake boost
-from such a task) go to idle fast cores first, tasks less important than nice 0 to idle
-slower ones first, nice 0 takes any. A task that runs alone on a core of the other kind
+favored cores of Intel's Turbo Boost Max 3.0, all count as fast), tasks more important
+than nice 0 (a lower nice value, or a wake boost from such a task) go to idle fast cores
+first (the fastest of them first), tasks less important than nice 0 to idle slower ones
+first, nice 0 takes any.
+
+On Intel cpus with Hyper-Threading (12th to 14th gen, Meteor Lake) the kernel reports
+no capacities, all cores look equally fast. There elara takes the core types from the
+perf driver (`/sys/devices/cpu_core/cpus`, `cpu_atom`, `cpu_lowpower`) and works out
+the capacities like intel_pstate does without Hyper-Threading: from the highest
+frequency of each core (`cpufreq/cpuinfo_max_freq`) and the performance units of the
+two core types. The log says "capacities from the Intel core types" then. A task that runs alone on a core of the other kind
 while one of its kind is idle moves there at the end of its slice, the same way as with
 SMT. Balancing by weight counts a slower core heavier by its speed: it gets through the
 same work in more time.
