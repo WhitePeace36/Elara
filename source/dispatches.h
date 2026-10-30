@@ -140,11 +140,22 @@ static __always_inline s32 claim_idle_near(const struct task_struct* p, u32 cpu,
   return claim_idle_in_llc(p, llc, false);
 }
 
-// A cpu of @llc that @p may run on runs a task that only runs for a moment, and
-// nothing waits there: it is free again in a moment.
-static __always_inline bool llc_frees_soon(const struct task_struct* p, u32 llc)
+// @cpu runs a task that only runs for a moment, and nothing waits there: it is
+// free again in a moment.
+static __always_inline bool cpu_frees_soon(const struct task_struct* p, u32 cpu)
 {
-  llc &= (MAX_CPUS - 1);
+  struct dispatch_ctx* dctx = get_dispatch_ctx(cpu);
+  return dctx && dctx->running_deadline != DEADLINE_NONE && dctx->running_short && bpf_cpumask_test_cpu(cpu, p->cpus_ptr) &&
+         !dsq_queued(cpu_dsq(cpu)) && !dsq_queued(SCX_DSQ_LOCAL_ON | cpu);
+}
+
+// A cpu of the llc of @cpu that is free again in a moment (cpu_frees_soon()),
+// @cpu itself first, -1 if there is none.
+static __always_inline s32 llc_frees_soon(const struct task_struct* p, u32 cpu)
+{
+  if (cpu_frees_soon(p, cpu))
+    return cpu;
+  u32 llc = cpu_llc_id(cpu) & (MAX_CPUS - 1);
   u32 start = llc_start[llc];
   u32 nr = llc_len[llc];
   u32 i;
@@ -152,12 +163,10 @@ static __always_inline bool llc_frees_soon(const struct task_struct* p, u32 llc)
   bpf_for(i, 0, nr)
   {
     u32 c = llc_cpus[(start + i) & (MAX_CPUS - 1)];
-    struct dispatch_ctx* dctx = get_dispatch_ctx(c);
-    if (dctx && dctx->running_deadline != DEADLINE_NONE && dctx->running_short && bpf_cpumask_test_cpu(c, p->cpus_ptr) &&
-        !dsq_queued(cpu_dsq(c)) && !dsq_queued(SCX_DSQ_LOCAL_ON | c))
-      return true;
+    if (cpu_frees_soon(p, c))
+      return c;
   }
-  return false;
+  return -1;
 }
 
 // Claim an idle cpu for @p, whose cpu is @cpu, -1 if there is none. With fast
@@ -176,7 +185,7 @@ static __always_inline s32 pick_idle(const struct task_struct* p, const struct t
   if (nr_llcs > 1 && runs_short(tctx))
   {
     c = claim_idle_near(p, cpu, cpu);
-    if (c >= 0 || llc_frees_soon(p, cpu_llc_id(cpu)))
+    if (c >= 0 || llc_frees_soon(p, cpu) >= 0)
       return c;
   }
   if (smt)
@@ -294,11 +303,14 @@ static __always_inline s32 better_cpu_alone(const struct task_struct* p, struct 
   return -1;
 }
 
-// How much work would run on @cpu before a task with @deadline. @wakeup: the
-// task is woken up and may preempt.
-static __always_inline u64 cpu_load_ahead(u32 cpu, u64 deadline, bool wakeup)
+// How much work would run on @cpu before a task queued there with @slack and
+// @lag (its key there: the vtime reference of @cpu + @lag + @slack, see
+// set_queue_keys()). @wakeup: the task is woken up and may preempt, decided
+// like enqueue() does: by key, with PREEMPT_MARGIN_NS.
+static __always_inline u64 cpu_load_ahead(u32 cpu, u64 slack, s64 lag, bool wakeup)
 {
   u64 load = 0;
+  u64 key = cpu_vtime_ref(cpu) + lag + slack;
 
   struct dispatch_ctx* dctx = get_dispatch_ctx(cpu);
   if (dctx && dctx->running_deadline != DEADLINE_NONE)
@@ -307,7 +319,7 @@ static __always_inline u64 cpu_load_ahead(u32 cpu, u64 deadline, bool wakeup)
     // preempts it. A task that comes back after its slice doesn't preempt:
     // counting the running task as gone would make it move to a cpu where it
     // waits just as long, and leave its own cpu to worse tasks.
-    if (!wakeup || dctx->running_deadline <= deadline + PREEMPT_MARGIN_NS)
+    if (!wakeup || key + PREEMPT_MARGIN_NS >= dctx->running_key)
       load++;
   }
   // A cpu taken by an RT or deadline task is busy for everything. Without this
@@ -320,7 +332,7 @@ static __always_inline u64 cpu_load_ahead(u32 cpu, u64 deadline, bool wakeup)
 
   u64 dsq = cpu_dsq(cpu);
   u64 queued = dsq_queued(dsq);
-  if (queued && dsq_head_deadline(dsq) <= deadline)
+  if (queued && dsq_head_key(dsq) <= key)
     load += queued;
 
   return load;
@@ -397,6 +409,10 @@ static __always_inline s32 pick_other_llc(const struct task_struct* p, u32 cpu)
   // Per cpu, the own llc is heavier by more than half of @p's weight spread
   // over both: after the move the difference is smaller than before.
   if (own_sum * other_n <= other_sum * own_n + w * (own_n + other_n) / 2)
+    return -1;
+  // One move into an llc per scan: the least loaded cpu there is taken by this
+  // one (the next tasks would all pile onto it until the next scan).
+  if (__sync_val_compare_and_swap(&llc_light_cpu[other], best, -1) != best)
     return -1;
   // Until the next scan the move counts already, so the next task doesn't
   // follow on the same numbers. Not below 0: the numbers are from the last
@@ -505,9 +521,9 @@ static __always_inline s32 pick_balance_cpu(struct task_struct* p, struct task_c
   return best;
 }
 
-static __always_inline s32 pick_enqueue_cpu(struct task_struct* p, struct task_ctx* tctx, u64 deadline, u64 slack, u32 cpu, u64 now, bool wakeup)
+static __always_inline s32 pick_enqueue_cpu(struct task_struct* p, struct task_ctx* tctx, s64 lag, u64 slack, u32 cpu, u64 now, bool wakeup)
 {
-  u64 best_load = cpu_load_ahead(cpu, deadline, wakeup);
+  u64 best_load = cpu_load_ahead(cpu, slack, lag, wakeup);
   if (best_load == 0)
   {
     s32 better = better_idle(p, tctx, cpu);
@@ -531,6 +547,21 @@ static __always_inline s32 pick_enqueue_cpu(struct task_struct* p, struct task_c
     if ((u32)idle != cpu)
       tctx->last_migrated_at = now;
     return idle;
+  }
+
+  // A task that runs only for a moment found no idle cpu in its llc because one
+  // there is free again in a moment (see pick_idle()): it waits for that one,
+  // not behind a task that keeps running (up to a slice) while cpus of another
+  // llc are idle.
+  if (nr_llcs > 1 && runs_short(tctx))
+  {
+    s32 soon = llc_frees_soon(p, cpu);
+    if (soon >= 0 && best_load > 0)
+    {
+      if ((u32)soon != cpu)
+        tctx->last_migrated_at = now;
+      return soon;
+    }
   }
 
   // The rate limit for moving tasks doesn't apply when the own cpu is taken by
@@ -562,7 +593,7 @@ static __always_inline s32 pick_enqueue_cpu(struct task_struct* p, struct task_c
     if (!bpf_cpumask_test_cpu(other, p->cpus_ptr))
       continue;
 
-    u64 load = cpu_load_ahead(other, deadline, wakeup);
+    u64 load = cpu_load_ahead(other, slack, lag, wakeup);
     if (load < sc->best_load)
     {
       sc->best_load = load;
@@ -775,7 +806,14 @@ static __always_inline void llc_scan(void)
       continue;
     u32 l = cpu_llc_id(c) & (MAX_CPUS - 1);
     u64 load = capacity_load(cpu_rough_load(c, NULL), c);
-    llc_load_acc[l] += load;
+    // A task alone on its cpu can't use more than that cpu, however heavy it
+    // is: in the total it counts as at most nice 0. Otherwise a nice -5 task
+    // made its llc look as full as one with twice as many nice 0 tasks, and the
+    // nice 0 task next to it kept a cpu to itself while the other llc's shared.
+    // The least loaded cpu is still found by the full weight.
+    bool alone = dsq_queued(cpu_dsq(c)) + dsq_queued(SCX_DSQ_LOCAL_ON | c) == 0;
+    u64 counted = alone && load > NICE_0_WEIGHT && load < RT_CPU_WEIGHT ? NICE_0_WEIGHT : load;
+    llc_load_acc[l] += counted;
     llc_online_acc[l]++;
     if (load < llc_light_load_acc[l])
     {
@@ -869,7 +907,7 @@ static __always_inline bool take_overdue(struct dispatch_ctx* dctx, u64 dsq, u64
 //
 // Busy cpus don't take tasks from each other, so tasks stay on their cpu (and
 // its caches). Tasks that keep running are balanced when they are queued again
-// after their slice (pick_enqueue_cpu()).
+// after their slice (pick_balance_cpu()).
 //
 // Returns DSP_TOOK when a task was put into the local DSQ, DSP_PREV when prev
 // keeps running, DSP_NONE when there is nothing to run.

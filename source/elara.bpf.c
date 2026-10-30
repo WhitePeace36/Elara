@@ -194,7 +194,9 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(elara_init_task, struct task_struct* p, struct scx_
   tctx->shared_seen = 0;
   tctx->turns_since = 0;
   tctx->burst = 0;
-  tctx->run_avg = 0;
+  // Not known to run only for a moment until it slept once: a new process (a
+  // compiler started by make) would otherwise be kept in the llc of its parent.
+  tctx->run_avg = SHORT_RUN_NS;
   tctx->stopped_at = 0;
 
   return 0;
@@ -202,14 +204,6 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(elara_init_task, struct task_struct* p, struct scx_
 
 void BPF_STRUCT_OPS(elara_exit_task, struct task_struct* p, struct scx_exit_task_args* args) { }
 
-// Wake boost: a task woken by a task with a shorter slack takes over that slack
-// until it sleeps again, for a limited amount of cpu time.
-//
-// The waker passes on its own slack and weight, or, while it runs with a boost
-// itself that is less than WAKE_BOOST_CHAIN_MAX steps from the start of its
-// chain and not used up, that boost weakened by WAKE_BOOST_CHAIN_DECAY_NUM /
-// _DEN, if that is better. A chain started by a nice -5 task gets its slack
-// (~0.4ms) at the first step, then ~0.6, ~0.9 and ~1.35ms (nice 0: 3ms).
 // The task that wakes @p, NULL if there is none: the wakeup comes from an
 // interrupt (the current task is just the one that was interrupted), from the
 // idle task, or from a kernel thread unless @kthreads.
@@ -225,6 +219,14 @@ static __always_inline struct task_struct* waker_of(const struct task_struct* p,
   return waker;
 }
 
+// Wake boost: a task woken by a task with a shorter slack takes over that slack
+// until it sleeps again, for a limited amount of cpu time.
+//
+// The waker passes on its own slack and weight, or, while it runs with a boost
+// itself that is less than WAKE_BOOST_CHAIN_MAX steps from the start of its
+// chain and not used up, that boost weakened by WAKE_BOOST_CHAIN_DECAY_NUM /
+// _DEN, if that is better. A chain started by a nice -5 task gets its slack
+// (~0.4ms) at the first step, then ~0.6, ~0.9 and ~1.35ms (nice 0: 3ms).
 static __always_inline void apply_wake_boost(struct task_struct* p, struct task_ctx* tctx)
 {
   struct task_struct* waker = waker_of(p, WAKE_BOOST_FROM_KTHREADS);
@@ -300,8 +302,8 @@ s32 BPF_STRUCT_OPS(elara_select_cpu, struct task_struct* p, s32 prev_cpu, u64 wa
   // The kernel's default takes an idle cpu of another llc when the own llc has
   // none, with SMT a whole idle core of another llc even before an idle cpu of
   // the own llc. A task that runs only for a moment stays in its llc (see
-  // SHORT_RUN_NS): on an idle cpu there, or queued there (enqueue() places it)
-  // when a cpu there is free again in a moment. Woken by a task that runs only
+  // SHORT_RUN_NS): on an idle cpu there, or queued on a cpu there that is free
+  // again in a moment (enqueue() places it). Woken by a task that runs only
   // for a moment too (they take turns, a pipe, a futex), the llc of its waker:
   // otherwise once they were apart each would stay near its own previous cpu.
   // Not a wakeup from an interrupt (the current task only happened to run
@@ -316,8 +318,8 @@ s32 BPF_STRUCT_OPS(elara_select_cpu, struct task_struct* p, s32 prev_cpu, u64 wa
       near = this_cpu;
     cpu = claim_idle_near(p, (u32)near, (u32)prev_cpu);
     is_idle = cpu >= 0;
-    if (!is_idle && bpf_cpumask_test_cpu(near, p->cpus_ptr) && llc_frees_soon(p, cpu_llc_id((u32)near)))
-      cpu = near;
+    if (!is_idle)
+      cpu = llc_frees_soon(p, (u32)near);
   }
   if (cpu < 0)
     cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
@@ -330,7 +332,7 @@ s32 BPF_STRUCT_OPS(elara_select_cpu, struct task_struct* p, s32 prev_cpu, u64 wa
     u64 now = bpf_ktime_get_ns();
     u64 slack = wakeup_slack(p, tctx);
     s64 lag = task_lag(p, tctx, true);
-    if (cpu_load_ahead(cpu, make_deadline(now, slack, lag), true) == 0)
+    if (cpu_load_ahead(cpu, slack, lag, true) == 0)
     {
       set_queue_keys(tctx, cpu, now, slack, lag);
       note_local_bound((u32)cpu, p);
@@ -441,7 +443,7 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
   // A woken task goes where it runs soonest, so does a re-enqueued one (it was
   // about to run, see enq_immed), a task that comes back after its slice is
   // balanced by weight.
-  u32 target = (enq_flags & SCX_ENQ_WAKEUP) || reenq ? (u32)pick_enqueue_cpu(p, tctx, deadline, slack, cpu, now, enq_flags & SCX_ENQ_WAKEUP)
+  u32 target = (enq_flags & SCX_ENQ_WAKEUP) || reenq ? (u32)pick_enqueue_cpu(p, tctx, lag, slack, cpu, now, enq_flags & SCX_ENQ_WAKEUP)
                                                      : (u32)pick_balance_cpu(p, tctx, slack, cpu, now);
   if (!cpu_is_online(target))
     target = cpu;

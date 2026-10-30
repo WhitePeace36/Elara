@@ -233,8 +233,11 @@ Balancing by weight stays in the llc of the task. With several llcs, a task that
 running and didn't move for 50ms (`LLC_BALANCE_NS`) also moves to another llc (one at
 random) that has clearly less weight per cpu, by the totals one cpu adds up every 4ms
 together with the scan for stuck cores: 6 such tasks on two llcs of 2 cores could
-otherwise stay split 4 and 2 for good. Tasks that sleep and wake each other aren't
-moved this way (see Several llcs below).
+otherwise stay split 4 and 2 for good. A task that runs alone on its core counts as at
+most nice 0 in these totals: it can't use more than that core, and a nice -5 task would
+otherwise make its llc look as full as one with more tasks. Into each llc, one task
+moves per 4ms, to the core with the least weight there. Tasks that sleep and wake each
+other aren't moved this way (see Several llcs below).
 
 For both:
 

@@ -99,9 +99,9 @@
 // running, because those were queued earlier.
 #define WAKE_SLACK_DIV 2
 
-// A waking task preempts the running task when its deadline is earlier by more
-// than this. Keeps tasks with nearly the same deadline from preempting each
-// other back and forth.
+// A waking task preempts the running task when its key is earlier by more than
+// this. Keeps tasks with nearly the same key from preempting each other back and
+// forth.
 #define PREEMPT_MARGIN_NS (250ULL * NS_PER_US)
 
 // Tasks with at most this slack check all cpus of their llc for the one with the
@@ -169,7 +169,8 @@
 #define STEAL_SCAN_DEPTH 8
 
 // A cpu doesn't take over a task that ran until less than this ago (unless its
-// cpu is taken by an RT task or stuck): it gets its own cpu back in a moment.
+// cpu runs a cpu bound task, is taken by an RT task or stuck, see
+// may_take_hot()): it gets its own cpu back in a moment.
 // An idle cpu that woke up for something else took a cpu bound task waiting
 // behind a short one (a kworker) away from its warm cache dozens of times a
 // second. The same as EEVDF's sched_migration_cost.
