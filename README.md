@@ -49,9 +49,10 @@ and background work at nice 5 or higher.
 ./build.sh
 ```
 
-`build.sh` regenerates `include/vmlinux.h` from the running kernel, and the BPF part is
-rebuilt whenever that file (or any other included header) changed, so after a kernel
-update just run it again.
+`include/vmlinux.h` (the kernel types the BPF part is built against) comes with the
+repository. To build against the running kernel instead (Linux 7.3 or newer), run
+`./create_vmlinux.h.sh` first: the BPF part is rebuilt whenever that file (or any other
+included header) changed.
 
 The loader is built for any cpu of the architecture. To build it with `-march=native`
 (the binary then only runs on cpus like the build machine), configure with

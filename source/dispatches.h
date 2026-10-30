@@ -399,8 +399,10 @@ static __always_inline s32 pick_other_llc(const struct task_struct* p, u32 cpu)
   if (own_sum * other_n <= other_sum * own_n + w * (own_n + other_n) / 2)
     return -1;
   // Until the next scan the move counts already, so the next task doesn't
-  // follow on the same numbers.
-  __sync_fetch_and_add(&llc_load[mine], -w);
+  // follow on the same numbers. Not below 0: the numbers are from the last
+  // scan, the own llc may have lost tasks since.
+  if (own_sum >= w)
+    __sync_fetch_and_add(&llc_load[mine], -w);
   __sync_fetch_and_add(&llc_load[other], w);
   return best;
 }
