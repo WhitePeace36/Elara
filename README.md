@@ -279,7 +279,8 @@ on average (`SHORT_RUN_NS`) stays in its llc when it wakes up: it takes an idle 
 there, with SMT even one whose sibling is busy before a whole idle core of another llc.
 If there is none, it waits for a cpu there that runs such a short task too and has
 nothing queued (free again in a moment) rather than taking an idle cpu of another llc.
-Woken by such a short task, it goes to the llc of its waker, not of its own previous
+A task with a slack of at most 1ms first looks for a cpu of its llc whose running task
+it preempts, and waits for the short task only if there is none. Woken by such a short task, it goes to the llc of its waker, not of its own previous
 cpu. Short tasks mostly wake each other (pipes, futexes, a game's threads, audio): in
 another llc the data they share has to go between the caches, which costs more than
 half a core or a short wait. Cpus of another llc don't take such a task over while it

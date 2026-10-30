@@ -150,6 +150,8 @@ struct pick_scratch
   u64 best_load;
   u64 sampled;
   s32 best;
+  // see pick_enqueue_cpu()
+  s32 soon;
 };
 
 struct

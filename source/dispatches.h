@@ -549,31 +549,34 @@ static __always_inline s32 pick_enqueue_cpu(struct task_struct* p, struct task_c
     return idle;
   }
 
+  u32 key = 0;
+  struct pick_scratch* sc = bpf_map_lookup_elem(&pick_scratch_map, &key);
+  if (!sc)
+    return cpu;
+
   // A task that runs only for a moment found no idle cpu in its llc because one
   // there is free again in a moment (see pick_idle()): it waits for that one,
   // not behind a task that keeps running (up to a slice) while cpus of another
-  // llc are idle.
-  if (nr_llcs > 1 && runs_short(tctx))
+  // llc are idle. A task that checks the whole llc (see SCAN_WHOLE_LLC_SLACK_NS)
+  // only if no cpu there runs it right away (one whose running task it
+  // preempts): it waited there for the short task to finish instead. Kept in
+  // the map over the scan below (see steal_scratch).
+  sc->soon = nr_llcs > 1 && runs_short(tctx) ? llc_frees_soon(p, cpu) : -1;
+  bool scan_whole_llc = slack <= SCAN_WHOLE_LLC_SLACK_NS;
+  if (!scan_whole_llc)
   {
-    s32 soon = llc_frees_soon(p, cpu);
-    if (soon >= 0 && best_load > 0)
+    s32 soon = sc->soon;
+    if (soon >= 0)
     {
       if ((u32)soon != cpu)
         tctx->last_migrated_at = now;
       return soon;
     }
+    // The rate limit for moving tasks doesn't apply when the own cpu is taken
+    // by an RT task: the task would wait until that one is done.
+    if (now - tctx->last_migrated_at < BALANCE_INTERVAL_NS && !cpu_taken_by_rt(cpu))
+      return cpu;
   }
-
-  // The rate limit for moving tasks doesn't apply when the own cpu is taken by
-  // an RT task: the task would wait until that one is done.
-  bool scan_whole_llc = slack <= SCAN_WHOLE_LLC_SLACK_NS;
-  if (!scan_whole_llc && now - tctx->last_migrated_at < BALANCE_INTERVAL_NS && !cpu_taken_by_rt(cpu))
-    return cpu;
-
-  u32 key = 0;
-  struct pick_scratch* sc = bpf_map_lookup_elem(&pick_scratch_map, &key);
-  if (!sc)
-    return cpu;
 
   sc->best_load = best_load;
   sc->best = cpu;
@@ -606,7 +609,7 @@ static __always_inline s32 pick_enqueue_cpu(struct task_struct* p, struct task_c
       break;
   }
 
-  s32 best = sc->best;
+  s32 best = sc->best_load > 0 && sc->soon >= 0 ? sc->soon : sc->best;
   if ((u32)best != cpu)
     tctx->last_migrated_at = now;
   return best;
