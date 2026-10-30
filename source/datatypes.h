@@ -70,6 +70,20 @@ struct task_ctx
   // idle cpu (+1, 0: none) dispatch claimed for this task, which runs alone on a
   // worse one (see better_cpu_alone())
   u32 upmigrate_cpu;
+  // its last run ended because its slice was used up, not because it slept
+  bool cpu_bound;
+  // since when it shares its core with a cpu bound task, when that was last seen
+  // (see better_cpu_alone())
+  u64 shared_since;
+  u64 shared_seen;
+  // since when it takes turns on its cpu with another cpu bound task, 0: it
+  // doesn't (see pick_balance_cpu())
+  u64 turns_since;
+  // cpu time since it last woke up, and on average per wakeup (see runs_short())
+  u64 burst;
+  u64 run_avg;
+  // when it last stopped running (see cache_hot())
+  u64 stopped_at;
 };
 
 struct dispatch_ctx
@@ -97,6 +111,12 @@ struct dispatch_ctx
   bool preempt_pending;
   // this cpu runs an RT or deadline task (as seen by the last sched_switch)
   bool rt_busy;
+  // the running task is cpu bound (see task_ctx.cpu_bound), and so was the task
+  // last put into the local DSQ (see note_local_bound())
+  bool running_cpu_bound;
+  bool local_cpu_bound;
+  // the running task runs only for a moment (see runs_short())
+  bool running_short;
 };
 
 // Set at the end of elara_init(). The sched_switch tracepoint can run before:
@@ -113,6 +133,17 @@ u64 nr_rt_busy;
 u64 stuck_scan_at;
 u32 nr_stuck_cpus;
 u8 stuck_cpu[MAX_CPUS];
+
+// Per llc, updated with the scan for stuck cpus (see llc_scan()): the rough
+// weight of its tasks (see cpu_rough_load()), its online cpus and the cpu with
+// the least weight. *_acc while the scan adds them up.
+u64 llc_load[MAX_CPUS];
+u32 llc_online[MAX_CPUS];
+s32 llc_light_cpu[MAX_CPUS];
+u64 llc_load_acc[MAX_CPUS];
+u32 llc_online_acc[MAX_CPUS];
+s32 llc_light_acc[MAX_CPUS];
+u64 llc_light_load_acc[MAX_CPUS];
 
 struct pick_scratch
 {

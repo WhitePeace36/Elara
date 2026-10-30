@@ -217,6 +217,24 @@ core is already in its local queue at that point, which elara can't look into: i
 weight is remembered when dispatch picks it (counting it as nice 0 kept a light task
 next to a heavy one while another core had only light tasks).
 
+It isn't balanced at all when the task that runs next on its core only runs for a
+moment (its last run ended in sleep: a woken task, a kworker): then it waits for its
+core and its warm cache, which is free again in a moment. Moving to an idle core
+instead moved cpu bound tasks dozens of times a second.
+
+A task that has taken turns on its core with another one that keeps running for 100ms
+(`ROTATE_NS`) also moves to a core with up to half its own weight more: with one task
+more than cores (3 on 2) the weights stay about equal, and the same two tasks would
+share a core for good while the third had one to itself. So every 100ms another one
+does.
+
+Balancing by weight stays in the llc of the task. With several llcs, a task that keeps
+running and didn't move for 50ms (`LLC_BALANCE_NS`) also moves to another llc (one at
+random) that has clearly less weight per cpu, by the totals one cpu adds up every 4ms
+together with the scan for stuck cores: 6 such tasks on two llcs of 2 cores could
+otherwise stay split 4 and 2 for good. Tasks that sleep and wake each other aren't
+moved this way (see Several llcs below).
+
 For both:
 
 - an idle core is always preferred
@@ -235,13 +253,34 @@ Offline cores (for example the second threads with SMT off) are never used.
 With SMT (two cpus per core) a cpu whose sibling is busy gets only part of the core.
 So wherever elara picks an idle cpu itself, a cpu of a whole idle core comes first (of
 the task's own llc, then any), and only then any idle cpu (again of the own llc first),
-the order of the kernel's default. A woken task whose own cpu is free but whose sibling
+the order of the kernel's default (except for short tasks with several llcs, see below). A woken task whose own cpu is free but whose sibling
 is busy moves to a whole idle core of the same llc if there is one: in another llc it
-would start with a cold cache, which costs more than sharing the core. For the same
-reason a task that keeps running alone on a cpu whose sibling is busy moves to a whole
-idle core of the same llc at the end of its slice (at most once every 10ms): an idle
-cpu can't take over a running task itself, so dispatch doesn't extend its slice and the kernel hands it back to enqueue() (`SCX_OPS_ENQ_LAST`, only
-set with SMT or fast and slower cores), which puts it there.
+would start with a cold cache, which costs more than sharing the core.
+
+A task that keeps running alone on a cpu moves to a whole idle core of the same llc at
+the end of its slice once it has shared its core for 4ms (`SMT_SHARE_NS`) with a task
+that keeps running too (one whose last slice was used up, or a realtime task), at most
+once every 10ms. Something that runs on the sibling for a moment is no reason to move.
+After 50ms of sharing (`SMT_CROSS_LLC_NS`) it also moves to a whole idle core of
+another llc when its own llc has none: over that time half a core costs more than the
+cold cache, and without it two tasks could share a core for good while a whole core of
+the other llc stayed idle. An idle cpu can't take over a running task itself, so
+dispatch doesn't extend its slice and the kernel hands it back to enqueue()
+(`SCX_OPS_ENQ_LAST`, only set with SMT or fast and slower cores), which puts it there.
+
+### Several llcs
+
+With several llcs (on Ryzen one per CCD) a task that runs for less than 4ms per wakeup
+on average (`SHORT_RUN_NS`) stays in its llc when it wakes up: it takes an idle cpu
+there, with SMT even one whose sibling is busy before a whole idle core of another llc.
+If there is none, it waits for a cpu there that runs such a short task too and has
+nothing queued (free again in a moment) rather than taking an idle cpu of another llc.
+Woken by such a short task, it goes to the llc of its waker, not of its own previous
+cpu. Short tasks mostly wake each other (pipes, futexes, a game's threads, audio): in
+another llc the data they share has to go between the caches, which costs more than
+half a core or a short wait. Cpus of another llc don't take such a task over while it
+is the only one waiting on its cpu, unless that cpu runs a task that keeps running.
+Tasks that run longer still take a whole idle core first, wherever it is.
 
 ### Fast and slower cores
 
@@ -323,7 +362,11 @@ From another core only tasks count that may run on this one (affinity, not
 migration-disabled), and of those the first in that core's queue: at most 8 tasks are
 looked at (`STEAL_SCAN_DEPTH`), 64 when taking tasks from a stuck core or one taken by a
 realtime task (`RESCUE_SCAN_DEPTH`). The first tasks there are often that core's own
-kernel threads, which can't move.
+kernel threads, which can't move. A task that ran until less than 0.5ms ago
+(`STEAL_HOT_NS`, the kernel's default `sched_migration_cost`) is left where it is while
+its core runs something that only runs for a moment: it gets its core back right away,
+with a warm cache. Behind a task that keeps running (a whole slice to wait), on a stuck
+core or one taken by a realtime task it is taken.
 
 When dispatch finds nothing else to run and the previous task goes on (a task elara
 has no context for), its slice is set to 1ms: the kernel would keep it running with its
@@ -339,8 +382,8 @@ scheduler, and in between the kernel waits for an RCU grace period. Tasks still
 queued on that cpu would wait for good: with the RCU kthread among them, the whole
 system stalled for 20s until the kernel's RCU stall detection ejected elara. So a
 cpu whose queue doesn't move (tasks queued, but none started or kept running for
-4 slices, `STUCK_NS`, counted from when its queue got its first task) counts as stuck: the other cpus take its tasks like those of a
-cpu taken by a realtime task, and placement treats it as busy. Every 4ms one cpu (the
+40 slices, `STUCK_NS`, counted from when its queue got its first task) counts as stuck:
+the other cpus take its tasks like those of a cpu taken by a realtime task, and placement treats it as busy. Every 4ms one cpu (the
 first to get there) looks for stuck cpus and marks them; the others only check that
 mark, so the check costs one scan of all cpus per 4ms for the whole system. This also
 covers a cpu held by long interrupt work.

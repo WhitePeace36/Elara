@@ -79,7 +79,13 @@
 // by long interrupt work. Other cpus take the tasks of a stuck cpu like those of
 // a cpu taken by an RT task, and placement treats it as busy. Every
 // STUCK_CHECK_INTERVAL_NS one cpu looks for stuck cpus for all (scan_stuck()).
-#define STUCK_NS (4 * SLICE_NS)
+//
+// Normally a queue moves at least once per slice, but a cpu can be held up for
+// a few ms without being stuck: in a virtual machine the host doesn't run its
+// vcpu for a while. With 4 slices the other cpus took tasks from such cpus all
+// the time (equal spinners on a test VM moved 10-25 times a second instead of
+// less than once); 40 still rescues long before anything stalls.
+#define STUCK_NS (40 * SLICE_NS)
 #define STUCK_CHECK_INTERVAL_NS (4ULL * NS_PER_MS)
 
 // Taking a task over from a cpu taken by an RT task or a stuck cpu, a cpu looks
@@ -105,6 +111,34 @@
 
 #define BALANCE_INTERVAL_NS (10ULL * NS_PER_MS)
 
+// With SMT, a task running alone on its cpu moves to a whole idle core of its llc
+// once it has shared its core with a cpu bound task (or an RT task) for
+// SMT_SHARE_NS: a task on the other cpu that keeps running for a few slices, not
+// one that only runs for a moment there. After SMT_CROSS_LLC_NS also to one of
+// another llc when its own llc has none: over that time the cold cache costs
+// less than half a core. Without this, two tasks could share a core for good
+// while a whole core of the other llc stayed idle.
+#define SMT_SHARE_NS (4 * SLICE_NS)
+#define SMT_CROSS_LLC_NS (50ULL * NS_PER_MS)
+
+// The slice of a task running alone only ends at a scheduler tick (nothing waits
+// for its cpu, so no slice timer): every 10ms with HZ=100. A longer gap between
+// two looks at the sibling (see SMT_SHARE_NS) means the task didn't run alone in
+// between, the time it shared its core starts over.
+#define SMT_SHARE_GAP_NS (20ULL * NS_PER_MS)
+
+// With several llcs, a task that runs for less than this per wakeup (on average,
+// see runs_short()) stays in its own llc: it takes an idle cpu there, with SMT
+// even one whose sibling is busy before a whole idle core of another llc, and
+// if there is none it waits for a cpu there that runs such a short task too
+// (free again in a moment) rather than taking an idle cpu of another llc. Woken
+// by such a short task, it goes to the llc of its waker instead. Such
+// tasks mostly wake each other (pipes, futexes, a game's threads, audio): in
+// another llc their data has to cross between the caches (on Ryzen between the
+// CCDs), and for a short run half a core or a short wait costs less than a cold
+// cache. A task that runs longer takes a whole idle core first, wherever it is.
+#define SHORT_RUN_NS (4 * SLICE_NS)
+
 // A task that comes back after its slice is balanced by weight: it moves to the
 // cpu with the least weight of other tasks (running and queued), if that is
 // lighter than its own cpu by more than half its own weight. A cpu taken by an
@@ -114,10 +148,32 @@
 #define WEIGHT_SCAN_DEPTH 16
 #define BALANCE_SAMPLES 2
 
+// A task that has taken turns on its cpu with another cpu bound task for this
+// long also moves to a cpu with about as much weight as its own (up to half its
+// own weight more, not only clearly less): with one task more than cpus (3 on 2)
+// the weights stay about equal, and without this the same two tasks shared a
+// cpu for good while the third had one to itself. So every ROTATE_NS a
+// different one does.
+#define ROTATE_NS (100ULL * NS_PER_MS)
+
+// Balancing by weight stays in the llc of a task. With several llcs, a task that
+// keeps running (cpu bound: tasks that wake each other stay together, see
+// SHORT_RUN_NS) and didn't move for this long also moves to another llc that
+// has clearly less weight per cpu. Without this, 6 tasks on 2 llcs of 2 cpus
+// could stay split 4 and 2 for good.
+#define LLC_BALANCE_NS (50ULL * NS_PER_MS)
+
 // When a cpu takes a task from another cpu, only tasks that may run on it count
 // (affinity, migration disabled). At most this many tasks of a queue are looked
 // at for the first such task (see also RESCUE_SCAN_DEPTH).
 #define STEAL_SCAN_DEPTH 8
+
+// A cpu doesn't take over a task that ran until less than this ago (unless its
+// cpu is taken by an RT task or stuck): it gets its own cpu back in a moment.
+// An idle cpu that woke up for something else took a cpu bound task waiting
+// behind a short one (a kworker) away from its warm cache dozens of times a
+// second. The same as EEVDF's sched_migration_cost.
+#define STEAL_HOT_NS (500ULL * NS_PER_US)
 
 #define DSQ_BASE 1536
 #define DEADLINE_NONE ((u64)-1)

@@ -189,6 +189,13 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(elara_init_task, struct task_struct* p, struct scx_
   tctx->resume_slice = 0;
   tctx->last_migrated_at = 0;
   tctx->upmigrate_cpu = 0;
+  tctx->cpu_bound = false;
+  tctx->shared_since = 0;
+  tctx->shared_seen = 0;
+  tctx->turns_since = 0;
+  tctx->burst = 0;
+  tctx->run_avg = 0;
+  tctx->stopped_at = 0;
 
   return 0;
 }
@@ -203,15 +210,25 @@ void BPF_STRUCT_OPS(elara_exit_task, struct task_struct* p, struct scx_exit_task
 // chain and not used up, that boost weakened by WAKE_BOOST_CHAIN_DECAY_NUM /
 // _DEN, if that is better. A chain started by a nice -5 task gets its slack
 // (~0.4ms) at the first step, then ~0.6, ~0.9 and ~1.35ms (nice 0: 3ms).
-static __always_inline void apply_wake_boost(struct task_struct* p, struct task_ctx* tctx)
+// The task that wakes @p, NULL if there is none: the wakeup comes from an
+// interrupt (the current task is just the one that was interrupted), from the
+// idle task, or from a kernel thread unless @kthreads.
+static __always_inline struct task_struct* waker_of(const struct task_struct* p, bool kthreads)
 {
   if (!bpf_in_task())
-    return;
-
+    return NULL;
   struct task_struct* waker = bpf_get_current_task_btf();
   if (!waker || waker == p || (waker->flags & PF_IDLE))
-    return;
-  if (!WAKE_BOOST_FROM_KTHREADS && (waker->flags & PF_KTHREAD))
+    return NULL;
+  if (!kthreads && (waker->flags & PF_KTHREAD))
+    return NULL;
+  return waker;
+}
+
+static __always_inline void apply_wake_boost(struct task_struct* p, struct task_ctx* tctx)
+{
+  struct task_struct* waker = waker_of(p, WAKE_BOOST_FROM_KTHREADS);
+  if (!waker)
     return;
 
   u64 waker_slack = task_slack(waker);
@@ -280,6 +297,28 @@ s32 BPF_STRUCT_OPS(elara_select_cpu, struct task_struct* p, s32 prev_cpu, u64 wa
       cpu = claim_idle_preferred(p, tctx);
     is_idle = cpu >= 0;
   }
+  // The kernel's default takes an idle cpu of another llc when the own llc has
+  // none, with SMT a whole idle core of another llc even before an idle cpu of
+  // the own llc. A task that runs only for a moment stays in its llc (see
+  // SHORT_RUN_NS): on an idle cpu there, or queued there (enqueue() places it)
+  // when a cpu there is free again in a moment. Woken by a task that runs only
+  // for a moment too (they take turns, a pipe, a futex), the llc of its waker:
+  // otherwise once they were apart each would stay near its own previous cpu.
+  // Not a wakeup from an interrupt (the current task only happened to run
+  // there: a disk or network interrupt, a timer) or by a kernel thread (a
+  // kworker finishing I/O is no partner).
+  if (cpu < 0 && nr_llcs > 1 && p->nr_cpus_allowed > 1 && runs_short(tctx))
+  {
+    s32 near = prev_cpu;
+    struct task_struct* waker = waker_of(p, false);
+    s32 this_cpu = bpf_get_smp_processor_id();
+    if (waker && bpf_cpumask_test_cpu(this_cpu, p->cpus_ptr) && runs_short(get_task_ctx(waker)))
+      near = this_cpu;
+    cpu = claim_idle_near(p, (u32)near, (u32)prev_cpu);
+    is_idle = cpu >= 0;
+    if (!is_idle && bpf_cpumask_test_cpu(near, p->cpus_ptr) && llc_frees_soon(p, cpu_llc_id((u32)near)))
+      cpu = near;
+  }
   if (cpu < 0)
     cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
 
@@ -294,6 +333,7 @@ s32 BPF_STRUCT_OPS(elara_select_cpu, struct task_struct* p, s32 prev_cpu, u64 wa
     if (cpu_load_ahead(cpu, make_deadline(now, slack, lag), true) == 0)
     {
       set_queue_keys(tctx, cpu, now, slack, lag);
+      note_local_bound((u32)cpu, p);
       scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SLICE_NS, 0);
     }
   }
@@ -318,6 +358,7 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
       tctx->upmigrate_cpu = 0;
     if (up && cpu_is_online(up - 1) && bpf_cpumask_test_cpu(up - 1, p->cpus_ptr))
     {
+      note_local_bound(up - 1, p);
       scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (up - 1), SLICE_NS, enq_flags);
       scx_bpf_kick_cpu(up - 1, SCX_KICK_IDLE);
       return;
@@ -327,6 +368,7 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
     // again.
     if (up)
       scx_bpf_kick_cpu(up - 1, SCX_KICK_IDLE);
+    note_local_bound(cpu, p);
     scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SLICE_NS, enq_flags);
     return;
   }
@@ -363,6 +405,7 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
     if (idle >= 0 && cpu_is_online((u32)idle))
     {
       // running() moves the key over to the vtime of that cpu.
+      note_local_bound((u32)idle, p);
       scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (u32)idle, slice, enq_flags);
       scx_bpf_kick_cpu((u32)idle, SCX_KICK_IDLE);
       return;
@@ -402,6 +445,11 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
                                                      : (u32)pick_balance_cpu(p, tctx, slack, cpu, now);
   if (!cpu_is_online(target))
     target = cpu;
+  if (target != cpu)
+  {
+    tctx->turns_since = 0;
+    tctx->shared_since = 0;
+  }
 
   set_queue_keys(tctx, target, now, slack, lag);
   if (reenq)
@@ -427,6 +475,7 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
   {
     dctx->preempt_pending = true;
     dctx->preempt_key = tctx->key;
+    note_local_bound(target, p);
     scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | target, SLICE_NS, enq_flags | SCX_ENQ_PREEMPT);
     return;
   }
@@ -485,6 +534,10 @@ void BPF_STRUCT_OPS(elara_dispatch, s32 cpu, struct task_struct* prev)
       // preemption (dispatch is called before stopping then) keeps the boost,
       // key and deadline: the task gets the rest of its slice back.
       u64 used = elapsed(now, pctx->started_at);
+      pctx->burst += used;
+      // Its slice is used up (a preemption isn't that).
+      if (!dctx->preempt_pending)
+        pctx->cpu_bound = true;
       charge_wake_boost(pctx, used);
       charge_vtime(prev, pctx, used);
       if (!dctx->preempt_pending && boost_spent(pctx))
@@ -513,11 +566,24 @@ void BPF_STRUCT_OPS(elara_dispatch, s32 cpu, struct task_struct* prev)
   // keeps it running, with its default slice of 20ms if prev's is used up.
   if (res == DSP_NONE || !pctx || !dctx)
   {
+    if (pctx)
+      pctx->turns_since = 0;
     scx_bpf_task_set_slice(prev, SLICE_NS);
     if (dctx)
+    {
       dctx->last_progress = now;
+      if (pctx)
+      {
+        dctx->running_cpu_bound = pctx->cpu_bound;
+        dctx->running_short = runs_short(pctx);
+      }
+    }
     return;
   }
+
+  // It runs alone again: no more taking turns.
+  if (!dsq_queued(cpu_dsq(cpu)))
+    pctx->turns_since = 0;
 
   // prev runs alone, and an idle cpu is clearly better for it (see
   // better_cpu_alone()): its slice stays used up, so the kernel hands it to
@@ -552,6 +618,8 @@ void BPF_STRUCT_OPS(elara_dispatch, s32 cpu, struct task_struct* prev)
 
   pctx->key = prev_key;
   pctx->deadline = prev_deadline;
+  dctx->running_cpu_bound = pctx->cpu_bound;
+  dctx->running_short = runs_short(pctx);
   dctx->last_progress = now;
   scx_bpf_task_set_slice(prev, SLICE_NS);
   pctx->granted_slice = SLICE_NS;
@@ -578,6 +646,9 @@ void BPF_STRUCT_OPS(elara_running, struct task_struct* p)
   // the vtime of this cpu.
   if (context->vtime_cpu != cpu)
   {
+    // taken over by this cpu (see also enqueue())
+    context->turns_since = 0;
+    context->shared_since = 0;
     u64 slack = context->key - context->vtime;
     rebase_vtime(context, cpu, task_lag(p, context, false));
     context->key = context->vtime + slack;
@@ -587,6 +658,8 @@ void BPF_STRUCT_OPS(elara_running, struct task_struct* p)
 
   dispatch_ctx->running_key = context->key;
   dispatch_ctx->running_deadline = context->deadline;
+  dispatch_ctx->running_cpu_bound = context->cpu_bound;
+  dispatch_ctx->running_short = runs_short(context);
   dispatch_ctx->preempt_pending = false;
 
   // Out of the local DSQ (see note_local()).
@@ -609,7 +682,11 @@ void BPF_STRUCT_OPS(elara_running, struct task_struct* p)
   context->resume_slice = 0;
   start_slice(cpu, dispatch_ctx, context->started_at, p->scx.slice);
 
-  kick_idle_for_waiting(cpu);
+  // Tasks waiting behind a task that only runs for a moment get the cpu back
+  // right after it (see pick_balance_cpu()); an idle cpu would take them away
+  // from their warm cache.
+  if (context->cpu_bound)
+    kick_idle_for_waiting(cpu);
 }
 
 void BPF_STRUCT_OPS(elara_stopping, struct task_struct* task, bool runnable)
@@ -630,6 +707,17 @@ void BPF_STRUCT_OPS(elara_stopping, struct task_struct* task, bool runnable)
 
   if (dctx->preempt_pending && runnable && task->scx.slice == 0 && tctx->granted_slice > used_ns + RESUME_SLICE_MIN_NS)
     tctx->resume_slice = tctx->granted_slice - used_ns;
+
+  tctx->burst += used_ns;
+  if (!runnable)
+  {
+    tctx->run_avg = (3 * tctx->run_avg + tctx->burst) / 4;
+    tctx->burst = 0;
+    tctx->cpu_bound = false;
+    tctx->turns_since = 0;
+    tctx->shared_since = 0;
+  }
+  tctx->stopped_at = now;
 
   // A wake boost ends when the task sleeps or its budget is used up, a
   // preempted task keeps it for the rest of its slice.

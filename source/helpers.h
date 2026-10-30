@@ -223,6 +223,16 @@ static __always_inline u64 make_deadline(u64 now, u64 slack, s64 lag)
   return now + slack + lag;
 }
 
+// @p was put into the local DSQ of @cpu: whether it is cpu bound decides if a
+// task that comes back after its slice there waits for it (pick_balance_cpu()).
+static __always_inline void note_local_bound(u32 cpu, const struct task_struct* p)
+{
+  struct dispatch_ctx* dctx = get_dispatch_ctx(cpu);
+  struct task_ctx* tctx = get_task_ctx((struct task_struct*)p);
+  if (dctx)
+    dctx->local_cpu_bound = !tctx || tctx->cpu_bound;
+}
+
 // Dispatch of @cpu (this cpu) put @p into its local DSQ. The DSQ can't be looked
 // into, but right after a slice the task that runs next is already in it, and
 // balancing the task that comes back after its slice (pick_balance_cpu()) needs
@@ -233,6 +243,7 @@ static __always_inline void note_local(u32 cpu, const struct task_struct* p)
   struct dispatch_ctx* dctx = get_dispatch_ctx(cpu);
   if (dctx)
     dctx->local_weight = task_weight(p);
+  note_local_bound(cpu, p);
 }
 
 // @p comes back through enqueue() because an RT or deadline task preempted it
