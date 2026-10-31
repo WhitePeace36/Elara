@@ -11,6 +11,12 @@
 #include "defines.h"
 #include "nice_weights.h"
 
+// An argument of a global function that is a trusted pointer (a task the kernel
+// passed in), see pick_idle().
+#ifndef __arg_trusted
+#define __arg_trusted __attribute__((btf_decl_tag("arg:trusted")))
+#endif
+
 // The queue of @cpu: one per cpu, ordered by deadline.
 static __always_inline u64 cpu_dsq(u32 cpu)
 {

@@ -403,7 +403,7 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
   {
     tctx->resume_slice = 0;
     u64 slice = p->scx.slice > RESUME_SLICE_MIN_NS ? p->scx.slice : RESUME_SLICE_MIN_NS;
-    s32 idle = p->nr_cpus_allowed > 1 && !is_migration_disabled(p) ? pick_idle(p, tctx, cpu) : -1;
+    s32 idle = p->nr_cpus_allowed > 1 && !is_migration_disabled(p) ? pick_idle(p, cpu) : -1;
     if (idle >= 0 && cpu_is_online((u32)idle))
     {
       // running() moves the key over to the vtime of that cpu.

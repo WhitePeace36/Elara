@@ -177,8 +177,14 @@ static __always_inline s32 llc_frees_soon(const struct task_struct* p, u32 cpu)
 // default (scx_select_cpu_dfl()). Except for a task that runs only for a moment
 // with several llcs: any idle cpu of its own llc first, and none of another llc
 // while a cpu of its own is free again in a moment (see SHORT_RUN_NS).
-static __always_inline s32 pick_idle(const struct task_struct* p, const struct task_ctx* tctx, u32 cpu)
+//
+// A global function: the verifier checks it once, not again everywhere it is
+// called. Inlined, enqueue() had it four times and came to 86% of the
+// verifier's limit (1M instructions) with SMT, fast and slower cores and
+// several llcs, now about half.
+__noinline s32 pick_idle(struct task_struct* p __arg_trusted, u32 cpu)
 {
+  const struct task_ctx* tctx = get_task_ctx(p);
   s32 c = claim_idle_preferred(p, tctx);
   if (c >= 0)
     return c;
@@ -388,16 +394,17 @@ static __always_inline u64 capacity_load(u64 load, u32 cpu)
   return hybrid ? load * 1024 / cpu_cap(cpu) : load;
 }
 
-// With several llcs: a cpu of another llc (one at random) for @p, which keeps
-// running on @cpu, if that llc has clearly less weight per cpu than the own one
-// (moving @p evens them out, not just turns them around): the cpu with the
-// least weight there, as of the last llc_scan(). -1 if there is none.
+// With several llcs: a cpu of another llc (one at random, each the same often)
+// for @p, which keeps running on @cpu, if that llc has clearly less weight per
+// cpu than the own one (moving @p evens them out, not just turns them around):
+// the cpu with the least weight there, as of the last llc_scan(). -1 if there
+// is none.
 static __always_inline s32 pick_other_llc(const struct task_struct* p, u32 cpu)
 {
   u32 mine = cpu_llc_id(cpu) & (MAX_CPUS - 1);
-  u32 other = bpf_get_prandom_u32() % nr_llcs;
-  if (other == mine)
-    other = (other + 1) % nr_llcs;
+  u32 other = bpf_get_prandom_u32() % (nr_llcs - 1);
+  if (other >= mine)
+    other++;
   other &= MAX_CPUS - 1;
 
   u64 own_sum = llc_load[mine], other_sum = llc_load[other];
@@ -453,7 +460,7 @@ static __always_inline s32 pick_balance_cpu(struct task_struct* p, struct task_c
   if (!tctx->turns_since)
     tctx->turns_since = now;
 
-  s32 idle = pick_idle(p, tctx, cpu);
+  s32 idle = pick_idle(p, cpu);
   if (idle >= 0)
   {
     if ((u32)idle != cpu)
@@ -541,7 +548,7 @@ static __always_inline s32 pick_enqueue_cpu(struct task_struct* p, struct task_c
   if (p->nr_cpus_allowed == 1)
     return cpu;
 
-  s32 idle = pick_idle(p, tctx, cpu);
+  s32 idle = pick_idle(p, cpu);
   if (idle >= 0)
   {
     if ((u32)idle != cpu)
@@ -996,7 +1003,7 @@ static __always_inline void kick_idle_for_waiting(u32 cpu)
 
   if (p && p->nr_cpus_allowed > 1 && !is_migration_disabled(p))
   {
-    s32 idle = pick_idle(p, get_task_ctx(p), cpu);
+    s32 idle = pick_idle(p, cpu);
     if (idle >= 0)
       scx_bpf_kick_cpu(idle, SCX_KICK_IDLE);
   }
