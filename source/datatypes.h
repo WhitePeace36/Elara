@@ -89,6 +89,9 @@ struct task_ctx
   bool rescued;
   // its last wakeup was a sync one (see SYNC_PREEMPT_MIN_NS), set by select_cpu()
   bool sync_wake;
+  // woken and put into a local DSQ to run right away (to preempt, or onto an
+  // idle cpu), until it starts (see reenq_immed())
+  bool immed;
 };
 
 struct dispatch_ctx

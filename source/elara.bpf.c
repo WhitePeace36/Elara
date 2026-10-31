@@ -204,6 +204,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(elara_init_task, struct task_struct* p, struct scx_
   tctx->run_avg = SHORT_RUN_NS;
   tctx->stopped_at = 0;
   tctx->rescued = false;
+  tctx->immed = false;
 
   return 0;
 }
@@ -349,6 +350,7 @@ s32 BPF_STRUCT_OPS(elara_select_cpu, struct task_struct* p, s32 prev_cpu, u64 wa
     {
       set_queue_keys(tctx, cpu, now, slack, lag);
       note_local_bound((u32)cpu, p);
+      tctx->immed = true;
       scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SLICE_NS, 0);
     }
   }
@@ -431,6 +433,37 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
     return;
   }
 
+  // A woken task handed back from the local DSQ it was put into to run right
+  // away, before it started (see reenq_immed()): when a second woken task was
+  // put there before the cpu switched (an earlier one takes the place of the
+  // one on its way, below), the kernel handed back both. As a plain
+  // re-enqueue it lost its wakeup slack and preemption and waited for the end
+  // of the running slice. It keeps its key, goes into the queue of its cpu
+  // and preempts by a kick if it is earlier than the running task; dispatch
+  // then runs such tasks by key. Not into the local DSQ again: it could be
+  // handed back again, and after a few times the kernel stops the scheduler.
+  if (tctx->immed && reenq_immed(p, enq_flags))
+  {
+    tctx->immed = false;
+    queue_on(cpu, now);
+    scx_bpf_dsq_insert_vtime(p, cpu_dsq(cpu), SLICE_NS, tctx->key, enq_flags);
+    struct dispatch_ctx* d = get_dispatch_ctx(cpu);
+    if (d && d->running_deadline != DEADLINE_NONE)
+    {
+      if (key_before(tctx->key + PREEMPT_MARGIN_NS, d->running_key))
+      {
+        d->preempt_pending = true;
+        scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
+      }
+      else
+        arm_slice_timer(cpu, d, now);
+    }
+    else
+      scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+    return;
+  }
+  tctx->immed = false;
+
   // A preempted task goes back to its own queue with the rest of its slice, its
   // key and deadline, unless its cpu is taken by an RT task now: then it is
   // placed like any other.
@@ -500,6 +533,7 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
     dctx->preempt_pending = true;
     dctx->preempt_key = tctx->key;
     note_local_bound(target, p);
+    tctx->immed = true;
     scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | target, SLICE_NS, enq_flags | SCX_ENQ_PREEMPT);
     return;
   }
@@ -705,6 +739,7 @@ void BPF_STRUCT_OPS(elara_running, struct task_struct* p)
   dispatch_ctx->running_short = runs_short(context);
   dispatch_ctx->running_brief = !context->cpu_bound && context->run_avg < BRIEF_RUN_NS;
   dispatch_ctx->preempt_pending = false;
+  context->immed = false;
 
   // Out of the local DSQ (see note_local()).
   dispatch_ctx->local_weight = 0;

@@ -282,6 +282,17 @@ static __always_inline bool reenq_preempted(const struct task_struct* p, u64 enq
   return (p->scx.flags & mask) == bpf_core_enum_value(enum scx_ent_flags, SCX_TASK_REENQ_PREEMPTED);
 }
 
+// @p comes back through enqueue() from a local DSQ it was put into, before it
+// started: another task was put there too, or the cpu wasn't free for it
+// (SCX_ENQ_IMMED, see enq_immed).
+static __always_inline bool reenq_immed(const struct task_struct* p, u64 enq_flags)
+{
+  if (!(enq_flags & SCX_ENQ_REENQ) || !bpf_core_enum_value_exists(enum scx_ent_flags, SCX_TASK_REENQ_IMMED))
+    return false;
+  u32 mask = bpf_core_enum_value(enum scx_ent_flags, SCX_TASK_REENQ_REASON_MASK);
+  return (p->scx.flags & mask) == bpf_core_enum_value(enum scx_ent_flags, SCX_TASK_REENQ_IMMED);
+}
+
 // Relative speed of @cpu, 1024 for the fastest cores.
 static __always_inline u32 cpu_cap(u32 cpu)
 {

@@ -162,8 +162,15 @@ into the local queue of the cpu with `SCX_ENQ_PREEMPT`, so the running task is p
 right away. A kick (`SCX_KICK_PREEMPT`) only takes effect through irq_work, which made a
 woken task wait about 1ms longer. The preempted task goes back into its queue with its
 key, deadline and the rest of its slice. When several tasks wake for the same cpu before
-it switched, only an earlier one replaces the task already on its way in (on 7.1+ the
-kernel hands the replaced one back to elara), a later one queues up behind it.
+it switched, only an earlier one replaces the task already on its way in, a later one
+queues up behind it. On 7.1+ the kernel then hands both back to elara (two tasks in a
+local queue can't both run right away, see `SCX_OPS_ALWAYS_ENQ_IMMED` below): they keep
+their keys, go into the queue of the cpu and preempt the running task by a kick, and
+dispatch runs them by key. Treated like any re-enqueued task, they lost their
+preemption and waited up to the end of the running slice; under load (spinners and 60
+short tasks on 2 cpus) that happened ~55 times a second. They don't go into the local
+queue again: the kernel could hand them back again, and stops the scheduler after a
+few times.
 
 A sync wakeup (a pipe or socket write: the writer goes on or sleeps right after) onto the
 cpu of its waker doesn't preempt the waker in the first 500us of its run
