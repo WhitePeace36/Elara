@@ -24,6 +24,15 @@
 
 #define RESUME_SLICE_MIN_NS (50 * NS_PER_US)
 
+// A task that runs for less than this per wakeup on average (and didn't use up
+// its last slice) gets no slice timer (see arm_slice_timer()): it sleeps before
+// its slice ends anyway. Each timer costs an irq_work interrupt to set it from
+// here and one more when it fires: on the test VM, a cpu bound thread sharing
+// its cpu with a task that ran 300us and slept 200us got ~4k more timer
+// interrupts in 7s than with EEVDF, now fewer. If such a task does run until
+// the end of its slice, the next tick ends it.
+#define BRIEF_RUN_NS (SLICE_NS / 2)
+
 // ---------------------------------------------------------------------------
 // Deadlines
 // ---------------------------------------------------------------------------
@@ -62,8 +71,9 @@
 // Weighted shares alone can let a task wait very long: a SCHED_IDLE task next to
 // a nice -20 task that keeps running gets a slice every ~50s, and the sched_ext
 // watchdog stops the scheduler after 30s. So the deadline is also a promise:
-// every STARVE_CHECK_INTERVAL_NS a cpu looks at its queue (at most the last
-// STARVE_SCAN_DEPTH tasks, where the long waiting ones are) for a task more than
+// every STARVE_CHECK_INTERVAL_NS a cpu looks at STARVE_SCAN_DEPTH tasks of its
+// queue (from the end, where the long waiting ones are, then the next ones
+// towards the front while it finds nothing) for a task more than
 // STARVE_GRACE_NS past its deadline, and runs it first. With normal shares this
 // hardly ever happens.
 #define STARVE_GRACE_NS (500ULL * NS_PER_MS)

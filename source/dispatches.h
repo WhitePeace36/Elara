@@ -325,7 +325,7 @@ static __always_inline u64 cpu_load_ahead(u32 cpu, u64 slack, s64 lag, bool wake
     // preempts it. A task that comes back after its slice doesn't preempt:
     // counting the running task as gone would make it move to a cpu where it
     // waits just as long, and leave its own cpu to worse tasks.
-    if (!wakeup || key + PREEMPT_MARGIN_NS >= dctx->running_key)
+    if (!wakeup || !key_before(key + PREEMPT_MARGIN_NS, dctx->running_key))
       load++;
   }
   // A cpu taken by an RT or deadline task is busy for everything. Without this
@@ -338,8 +338,12 @@ static __always_inline u64 cpu_load_ahead(u32 cpu, u64 slack, s64 lag, bool wake
 
   u64 dsq = cpu_dsq(cpu);
   u64 queued = dsq_queued(dsq);
-  if (queued && dsq_head_key(dsq) <= key)
-    load += queued;
+  if (queued)
+  {
+    u64 head_key = dsq_head_key(dsq);
+    if (head_key != DEADLINE_NONE && !key_before(key, head_key))
+      load += queued;
+  }
 
   return load;
 }
@@ -634,18 +638,39 @@ static __always_inline bool cache_hot(struct task_struct* p)
   return tctx && elapsed(bpf_ktime_get_ns(), tctx->stopped_at) < STEAL_HOT_NS;
 }
 
+// With SMT: the other cpu of the core of @cpu runs a cpu bound task (or an RT
+// task), a task taken by @cpu would get only part of the core.
+static __always_inline bool sibling_busy(u32 cpu)
+{
+  if (!smt)
+    return false;
+  s32 sibling = cpu_sibling[cpu & (MAX_CPUS - 1)];
+  if (sibling < 0)
+    return false;
+  struct dispatch_ctx* sd = get_dispatch_ctx((u32)sibling);
+  return (sd && sd->running_deadline != DEADLINE_NONE && sd->running_cpu_bound) || cpu_taken_by_rt((u32)sibling);
+}
+
 // A task of another cpu's queue that @cpu may take: allowed to run on it and not
 // pinned to its cpu for the moment (migrate_disable()). Unless @hot_ok, not one
-// that ran until a moment ago (see may_take_hot()), and from another llc (@far)
+// that ran until a moment ago (see may_take_hot()), from another llc (@far)
 // not one that runs only for a moment (see SHORT_RUN_NS) while it is the only
-// one waiting there: its own llc runs it soon.
+// one waiting there: its own llc runs it soon, and onto a core whose other cpu
+// runs a cpu bound task not a cpu bound one: it waits only behind a task that
+// runs for a moment and gets its whole core back. Taking it there, a short task
+// (a shell command) next to 4 spinners on 4 cores put two of them on one core
+// half of the time, and the SMT hand-back (better_cpu_alone()) moved one back a
+// few ms later, ~100 times a second.
 static __always_inline bool can_take(struct task_struct* p, u32 cpu, bool hot_ok, bool far)
 {
   if (is_migration_disabled(p) || !bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
     return false;
   if (hot_ok)
     return true;
-  return !cache_hot(p) && !(far && runs_short(get_task_ctx(p)));
+  struct task_ctx* tctx = get_task_ctx(p);
+  if (cache_hot(p) || (far && runs_short(tctx)))
+    return false;
+  return !(tctx && tctx->cpu_bound && sibling_busy(cpu));
 }
 
 // A task that ran until a moment ago may still be taken from @other when it
@@ -879,15 +904,34 @@ static __always_inline bool take_overdue(struct dispatch_ctx* dctx, u64 dsq, u64
 
   struct task_struct* p;
   u32 looked = 0;
+  u32 seen = 0;
+  u32 skip = dctx->starve_skip;
 
   // From the end of the queue: the tasks that wait longest are the ones with the
   // latest keys (low weight, large lag). Scanning from the front, they are out
-  // of reach as soon as more than STARVE_SCAN_DEPTH tasks are queued.
+  // of reach as soon as more than STARVE_SCAN_DEPTH tasks are queued. A window
+  // of STARVE_SCAN_DEPTH tasks that moves on towards the front while it finds
+  // nothing: tasks further in front can be overdue too (behind tasks of much
+  // higher weight: nice 0 next to nice -20 ones), they were never looked at.
   bpf_for_each(scx_dsq, p, dsq, SCX_DSQ_ITER_REV)
   {
+    if (seen < skip)
+    {
+      seen++;
+      continue;
+    }
     u64 deadline = task_deadline(p);
     if (deadline != DEADLINE_NONE && deadline + STARVE_GRACE_NS < now)
     {
+      // Mostly a task of low weight, whose vtime moves fast (nice 19: a
+      // second per 1ms slice). As the vtime reference of the cpu, that put
+      // the other tasks so far behind that their lag was clamped (see
+      // task_lag()): heavy tasks (small limit) lost their place, light ones
+      // (large limit) kept early keys. Under overload (5 nice -20 tasks
+      // per cpu) nice 10 tasks got more than nice -10 ones.
+      struct task_ctx* rctx = get_task_ctx(p);
+      if (rctx)
+        rctx->rescued = true;
       if (!scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, SCX_DSQ_LOCAL, 0))
         return false;
       note_local(bpf_get_smp_processor_id(), p);
@@ -896,6 +940,8 @@ static __always_inline bool take_overdue(struct dispatch_ctx* dctx, u64 dsq, u64
     if (++looked >= STARVE_SCAN_DEPTH)
       break;
   }
+  // Nothing overdue in this window: the next one, or from the end again.
+  dctx->starve_skip = looked >= STARVE_SCAN_DEPTH ? skip + STARVE_SCAN_DEPTH : 0;
   return false;
 }
 
@@ -960,7 +1006,7 @@ static __always_inline u32 dispatch_dsq_per_cpu(u32 cpu, u64 prev_key, u64 prev_
   if (take_overdue(dctx, own_dsq, now))
     return DSP_TOOK;
 
-  if (prev_key != DEADLINE_NONE && prev_key <= own_key)
+  if (prev_key != DEADLINE_NONE && (own_key == DEADLINE_NONE || !key_before(own_key, prev_key)))
     return DSP_PREV;
   if (own_key != DEADLINE_NONE)
   {

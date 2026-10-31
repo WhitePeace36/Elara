@@ -17,6 +17,15 @@
 #define __arg_trusted __attribute__((btf_decl_tag("arg:trusted")))
 #endif
 
+// Key @a comes before key @b, compared like the kernel orders our queues
+// (time_before64()): keys are vtimes, which wrap around after ~208 days of cpu
+// time of a nice 17-19 or SCHED_IDLE task on one cpu (1024ns of vtime per ns).
+// Neither may be DEADLINE_NONE (no key).
+static __always_inline bool key_before(u64 a, u64 b)
+{
+  return (s64)(a - b) < 0;
+}
+
 // The queue of @cpu: one per cpu, ordered by deadline.
 static __always_inline u64 cpu_dsq(u32 cpu)
 {

@@ -41,6 +41,8 @@ static int slice_timer_fn(void* map, u32* key, struct elara_timer* st)
   u64 now = bpf_ktime_get_ns();
   if (now < dctx->slice_end)
   {
+    if (dctx->running_brief)
+      return 0;
     dctx->timer_end = dctx->slice_end;
     bpf_timer_start(&st->timer, dctx->slice_end - now, BPF_F_TIMER_CPU_PIN);
     return 0;
@@ -59,6 +61,8 @@ static int slice_timer_fn(void* map, u32* key, struct elara_timer* st)
 // slice, not for every switch.
 static __always_inline void arm_slice_timer(u32 cpu, struct dispatch_ctx* dctx, u64 now)
 {
+  if (dctx->running_brief)
+    return;
   u64 end = dctx->slice_end;
   if (dctx->timer_end > now && dctx->timer_end <= end)
     return;
@@ -123,6 +127,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(elara_init)
     dispatch_ctx->running_key = DEADLINE_NONE;
     dispatch_ctx->vtime_ref = VTIME_BASE;
     dispatch_ctx->last_starve_check = 0;
+    dispatch_ctx->starve_skip = 0;
     dispatch_ctx->last_progress = 0;
     dispatch_ctx->slice_end = 0;
     dispatch_ctx->timer_end = 0;
@@ -198,6 +203,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(elara_init_task, struct task_struct* p, struct scx_
   // compiler started by make) would otherwise be kept in the llc of its parent.
   tctx->run_avg = SHORT_RUN_NS;
   tctx->stopped_at = 0;
+  tctx->rescued = false;
 
   return 0;
 }
@@ -473,7 +479,7 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
   // preempted right away. A kick (SCX_KICK_PREEMPT) only takes effect through
   // irq_work, which on the test VM cost a woken task ~1.5ms more than EEVDF.
   // Background work doesn't preempt (see background_policy()).
-  bool preempt = (enq_flags & SCX_ENQ_WAKEUP) && running_ours && tctx->key + PREEMPT_MARGIN_NS < dctx->running_key && !background_policy(p);
+  bool preempt = (enq_flags & SCX_ENQ_WAKEUP) && running_ours && key_before(tctx->key + PREEMPT_MARGIN_NS, dctx->running_key) && !background_policy(p);
   // The waker runs on @target (this cpu, called from its wakeup) and the
   // wakeup is a sync one (see SYNC_PREEMPT_MIN_NS).
   bool sync = tctx->sync_wake;
@@ -485,10 +491,11 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
   // earlier task takes its place (with enq_immed the kernel hands that one
   // back, otherwise it runs right after), a later one queues up behind it. The
   // slice of that one ends on time (start_slice() arms the timer).
-  bool behind = preempt && dctx->preempt_key && tctx->key >= dctx->preempt_key;
+  bool behind = preempt && dctx->preempt_key && !key_before(tctx->key, dctx->preempt_key);
   if (behind)
     preempt = false;
-  if (preempt && tctx->key <= dsq_head_key(cpu_dsq(target)))
+  u64 head_key = preempt ? dsq_head_key(cpu_dsq(target)) : DEADLINE_NONE;
+  if (preempt && (head_key == DEADLINE_NONE || !key_before(head_key, tctx->key)))
   {
     dctx->preempt_pending = true;
     dctx->preempt_key = tctx->key;
@@ -502,9 +509,17 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
 
   if (behind)
     return;
+  // Wake the cpu if it is idle. A kick costs an irq_work interrupt even when
+  // it does nothing, so not for a task queued on its own cpu when that cpu
+  // picks a task anyway: a woken one (the wakeup reschedules the cpu if it is
+  // idle, wakeup_preempt()), or one that comes back after its slice on this
+  // cpu, which is about to pick the next task (not a re-enqueue, which can
+  // come from a timer on an idle cpu).
   if (!running_ours)
   {
-    scx_bpf_kick_cpu(target, SCX_KICK_IDLE);
+    bool picks_anyway = target == cpu && ((enq_flags & SCX_ENQ_WAKEUP) || (target == bpf_get_smp_processor_id() && bpf_in_task() && !reenq));
+    if (!picks_anyway)
+      scx_bpf_kick_cpu(target, SCX_KICK_IDLE);
     return;
   }
 
@@ -524,7 +539,12 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
     return;
   }
   arm_slice_timer(target, dctx, now);
-  scx_bpf_kick_cpu(target, SCX_KICK_IDLE);
+  // The running task stopped in the meantime, and its cpu may have looked for
+  // a task before this one was queued: wake it. Otherwise it finds this task
+  // when its running task stops. A kick always costs an irq_work interrupt
+  // here, even when the cpu is busy and ignores it.
+  if (*(volatile u64*)&dctx->running_deadline == DEADLINE_NONE)
+    scx_bpf_kick_cpu(target, SCX_KICK_IDLE);
 }
 
 void BPF_STRUCT_OPS(elara_dispatch, s32 cpu, struct task_struct* prev)
@@ -593,6 +613,7 @@ void BPF_STRUCT_OPS(elara_dispatch, s32 cpu, struct task_struct* prev)
       {
         dctx->running_cpu_bound = pctx->cpu_bound;
         dctx->running_short = runs_short(pctx);
+        dctx->running_brief = false;
       }
     }
     return;
@@ -630,13 +651,14 @@ void BPF_STRUCT_OPS(elara_dispatch, s32 cpu, struct task_struct* prev)
   // The vtime reference follows the running task also when it keeps the cpu:
   // otherwise a task that runs alone for long builds up a lag against its own
   // cpu and carries it along as debt when it moves.
-  if ((s64)(pctx->vtime - dctx->vtime_ref) > 0)
+  if (!pctx->rescued && (s64)(pctx->vtime - dctx->vtime_ref) > 0)
     dctx->vtime_ref = pctx->vtime;
 
   pctx->key = prev_key;
   pctx->deadline = prev_deadline;
   dctx->running_cpu_bound = pctx->cpu_bound;
   dctx->running_short = runs_short(pctx);
+  dctx->running_brief = false;
   dctx->last_progress = now;
   scx_bpf_task_set_slice(prev, SLICE_NS);
   pctx->granted_slice = SLICE_NS;
@@ -672,7 +694,7 @@ void BPF_STRUCT_OPS(elara_running, struct task_struct* p)
     rebase_vtime(context, cpu, task_lag(p, context, false));
     context->key = context->vtime + slack;
   }
-  if ((s64)(context->vtime - dispatch_ctx->vtime_ref) > 0)
+  if (!context->rescued && (s64)(context->vtime - dispatch_ctx->vtime_ref) > 0)
     dispatch_ctx->vtime_ref = context->vtime;
 
   dispatch_ctx->running_key = context->key;
@@ -681,6 +703,7 @@ void BPF_STRUCT_OPS(elara_running, struct task_struct* p)
   dispatch_ctx->running_slack = effective_slack(p, context);
   dispatch_ctx->running_cpu_bound = context->cpu_bound;
   dispatch_ctx->running_short = runs_short(context);
+  dispatch_ctx->running_brief = !context->cpu_bound && context->run_avg < BRIEF_RUN_NS;
   dispatch_ctx->preempt_pending = false;
 
   // Out of the local DSQ (see note_local()).
@@ -739,6 +762,7 @@ void BPF_STRUCT_OPS(elara_stopping, struct task_struct* task, bool runnable)
     tctx->shared_since = 0;
   }
   tctx->stopped_at = now;
+  tctx->rescued = false;
 
   // A wake boost ends when the task sleeps or its budget is used up, a
   // preempted task keeps it for the rest of its slice.

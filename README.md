@@ -122,9 +122,14 @@ very long (a SCHED_IDLE task next to a nice -20 task that keeps running would ge
 slice every ~50s, and the sched_ext watchdog stops the scheduler after 30s), so the
 deadline is also a promise: every 10ms (`STARVE_CHECK_INTERVAL_NS`) a cpu looks at its
 queue for a task more than 500ms (`STARVE_GRACE_NS`) past its deadline and runs it
-first. It looks from the end of the queue (at most 32 tasks): the tasks that wait
-longest have the latest keys, so with many queued tasks they would be out of reach from
-the front. With normal shares this hardly ever happens.
+first. It looks at 32 tasks from the end of the queue: the tasks that wait longest have
+the latest keys, so with many queued tasks they would be out of reach from the front.
+While it finds nothing there, the next check looks at the next 32 towards the front, so
+a task in the middle (a nice 0 task among nice -20 ones) is reached too. A task run this
+way doesn't move the vtime reference of its cpu: a nice 19 task gains about a second of
+vtime per 1ms slice, which put every other task so far behind that the heavy ones lost
+their place (their lag limit is small) and nice 10 tasks got more than nice -10 ones.
+With normal shares this hardly ever happens.
 
 ## Preemption
 
@@ -138,7 +143,12 @@ more than 4ms. So elara ends slices on time itself: when a slice starts while ot
 wait for the core, or when a task is queued behind the running one later, a per-core
 timer (`slice_timers`) is set to the end of the slice and preempts the running task
 then. A task queued behind a running task that is already past its slice preempts it
-right away. When nothing waits, no timer is set and the task just keeps running.
+right away. When nothing waits, no timer is set and the task just keeps running. Nor
+for a task that runs for less than half a slice per wakeup on average
+(`BRIEF_RUN_NS`): it sleeps before its slice ends anyway, and setting the timer costs
+an interrupt (irq_work) and its expiry another. If it runs on for once, the next tick
+ends its slice. Kicks of idle cores (each an irq_work too) are left out where the core
+picks a task anyway.
 
 While an RT task runs on some core, the timer is set on the other cores too: tasks
 stuck in the queue of the RT core are only taken over when another core's slice ends.
@@ -283,6 +293,12 @@ cold cache, and without it two tasks could share a core for good while a whole c
 the other llc stayed idle. An idle cpu can't take over a running task itself, so
 dispatch doesn't extend its slice and the kernel hands it back to enqueue()
 (`SCX_OPS_ENQ_LAST`, only set with SMT or fast and slower cores), which puts it there.
+
+An idle cpu whose sibling runs a task that keeps running doesn't take over such a task
+from another cpu where it only waits behind a short one (a shell command): it gets its
+whole core back in a moment. Taking it put two of 4 spinners on 4 cores on one core
+half of the time, and the move to a whole idle core above took one away again a few ms
+later, about 100 times a second.
 
 ### Several llcs
 

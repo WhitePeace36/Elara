@@ -84,6 +84,9 @@ struct task_ctx
   u64 run_avg;
   // when it last stopped running (see cache_hot())
   u64 stopped_at;
+  // run by take_overdue() (far past its deadline), until it stops: its vtime
+  // doesn't move the vtime reference of its cpu
+  bool rescued;
   // its last wakeup was a sync one (see SYNC_PREEMPT_MIN_NS), set by select_cpu()
   bool sync_wake;
 };
@@ -97,6 +100,9 @@ struct dispatch_ctx
   u64 vtime_ref;
   // last time this cpu looked for overdue tasks in its queue
   u64 last_starve_check;
+  // tasks take_overdue() skips from the end of the queue (the window it looks
+  // at moves on while it finds nothing)
+  u32 starve_skip;
   // last time a task started on this cpu or kept it for another slice, or its
   // queue got its first task (see STUCK_NS)
   u64 last_progress;
@@ -121,8 +127,10 @@ struct dispatch_ctx
   // last put into the local DSQ (see note_local_bound())
   bool running_cpu_bound;
   bool local_cpu_bound;
-  // the running task runs only for a moment (see runs_short())
+  // the running task runs only for a moment (see runs_short()), and even
+  // much shorter than a slice (see BRIEF_RUN_NS)
   bool running_short;
+  bool running_brief;
 };
 
 // Set at the end of elara_init(). The sched_switch tracepoint can run before:
