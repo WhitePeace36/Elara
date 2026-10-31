@@ -42,6 +42,16 @@ static __always_inline u64 task_weight(const struct task_struct* p)
   return nice_weights[idx];
 }
 
+// SCHED_BATCH and SCHED_IDLE tasks are background work: like EEVDF, they don't
+// preempt the running task when they wake up, don't get the shorter slack of a
+// woken task (WAKE_SLACK_DIV) and no wake boost. Otherwise a compiler marked as
+// batch (ananicy-cpp does that) that wakes up often cut into the slices of a
+// game. They still get their share by their nice value.
+static __always_inline bool background_policy(const struct task_struct* p)
+{
+  return p->policy == SCHED_BATCH || p->policy == SCHED_IDLE;
+}
+
 // Slack of a task from its nice value (see SLACK_NICE_0_NS).
 static __always_inline u64 task_slack(const struct task_struct* p)
 {

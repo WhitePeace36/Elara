@@ -229,6 +229,8 @@ static __always_inline struct task_struct* waker_of(const struct task_struct* p,
 // (~0.4ms) at the first step, then ~0.6, ~0.9 and ~1.35ms (nice 0: 3ms).
 static __always_inline void apply_wake_boost(struct task_struct* p, struct task_ctx* tctx)
 {
+  if (background_policy(p))
+    return;
   struct task_struct* waker = waker_of(p, WAKE_BOOST_FROM_KTHREADS);
   if (!waker)
     return;
@@ -272,9 +274,12 @@ static __always_inline void set_queue_keys(struct task_ctx* tctx, u32 cpu, u64 n
   tctx->deadline = make_deadline(now, slack, lag);
 }
 
-// Slack of a task for the time in the queue after a wakeup.
+// Slack of a task for the time in the queue after a wakeup (see
+// background_policy()).
 static __always_inline u64 wakeup_slack(struct task_struct* p, struct task_ctx* tctx)
 {
+  if (background_policy(p))
+    return effective_slack(p, tctx);
   return effective_slack(p, tctx) / WAKE_SLACK_DIV;
 }
 
@@ -285,6 +290,8 @@ s32 BPF_STRUCT_OPS(elara_select_cpu, struct task_struct* p, s32 prev_cpu, u64 wa
 
   if (tctx && (wake_flags & SCX_WAKE_TTWU))
     apply_wake_boost(p, tctx);
+  if (tctx)
+    tctx->sync_wake = wake_flags & SCX_WAKE_SYNC;
 
   // With fast and slower cores: an idle cpu of the kind the task prefers, its
   // previous one if that is such a cpu and idle.
@@ -332,7 +339,7 @@ s32 BPF_STRUCT_OPS(elara_select_cpu, struct task_struct* p, s32 prev_cpu, u64 wa
     u64 now = bpf_ktime_get_ns();
     u64 slack = wakeup_slack(p, tctx);
     s64 lag = task_lag(p, tctx, true);
-    if (cpu_load_ahead(cpu, slack, lag, true) == 0)
+    if (cpu_load_ahead(cpu, slack, lag, !background_policy(p)) == 0)
     {
       set_queue_keys(tctx, cpu, now, slack, lag);
       note_local_bound((u32)cpu, p);
@@ -465,7 +472,15 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
   // straight to the local DSQ with SCX_ENQ_PREEMPT: the running task is
   // preempted right away. A kick (SCX_KICK_PREEMPT) only takes effect through
   // irq_work, which on the test VM cost a woken task ~1.5ms more than EEVDF.
-  bool preempt = (enq_flags & SCX_ENQ_WAKEUP) && running_ours && tctx->key + PREEMPT_MARGIN_NS < dctx->running_key;
+  // Background work doesn't preempt (see background_policy()).
+  bool preempt = (enq_flags & SCX_ENQ_WAKEUP) && running_ours && tctx->key + PREEMPT_MARGIN_NS < dctx->running_key && !background_policy(p);
+  // The waker runs on @target (this cpu, called from its wakeup) and the
+  // wakeup is a sync one (see SYNC_PREEMPT_MIN_NS).
+  bool sync = tctx->sync_wake;
+  tctx->sync_wake = false;
+  if (preempt && sync && bpf_in_task() && target == bpf_get_smp_processor_id() && effective_slack(p, tctx) >= dctx->running_slack &&
+      now - dctx->running_since < SYNC_PREEMPT_MIN_NS)
+    preempt = false;
   // Another woken task is already on its way in front of the running one: an
   // earlier task takes its place (with enq_immed the kernel hands that one
   // back, otherwise it runs right after), a later one queues up behind it. The
@@ -628,6 +643,8 @@ void BPF_STRUCT_OPS(elara_dispatch, s32 cpu, struct task_struct* prev)
   start_slice(cpu, dctx, now, SLICE_NS);
   dctx->running_key = prev_key;
   dctx->running_deadline = prev_deadline;
+  dctx->running_since = now;
+  dctx->running_slack = effective_slack(prev, pctx);
   dctx->preempt_pending = false;
 }
 
@@ -660,6 +677,8 @@ void BPF_STRUCT_OPS(elara_running, struct task_struct* p)
 
   dispatch_ctx->running_key = context->key;
   dispatch_ctx->running_deadline = context->deadline;
+  dispatch_ctx->running_since = bpf_ktime_get_ns();
+  dispatch_ctx->running_slack = effective_slack(p, context);
   dispatch_ctx->running_cpu_bound = context->cpu_bound;
   dispatch_ctx->running_short = runs_short(context);
   dispatch_ctx->preempt_pending = false;

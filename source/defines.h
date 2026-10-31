@@ -104,6 +104,18 @@
 // forth.
 #define PREEMPT_MARGIN_NS (250ULL * NS_PER_US)
 
+// A sync wakeup (WF_SYNC: a pipe or socket write, the waker goes on or sleeps
+// right after) of a task that is not more urgent than its waker (no shorter
+// slack) doesn't preempt the waker until it has run for this long: the woken
+// task waits until the waker sleeps or this much has passed (the slice ends).
+// Preempting at once, each message switched tasks: hackbench (20 senders and
+// receivers per group) took 35-40s on the 2-cpu test VM (EEVDF ~3s), with
+// this 22s. EEVDF has the same rule (sysctl_sched_migration_cost). Only the
+// waker itself: a task woken onto another cpu still preempts what runs there,
+// otherwise a pipeline of equally urgent tasks (an audio client and server,
+// both nice 0) missed its periods ten times as often.
+#define SYNC_PREEMPT_MIN_NS (500ULL * NS_PER_US)
+
 // Tasks with at most this slack check all cpus of their llc for the one with the
 // least work ahead of them, other tasks compare their cpu with BALANCE_SAMPLES
 // random ones.
@@ -241,6 +253,9 @@
 #endif
 #ifndef SCHED_RR
 #define SCHED_RR 2
+#endif
+#ifndef SCHED_BATCH
+#define SCHED_BATCH 3
 #endif
 #ifndef SCHED_IDLE
 #define SCHED_IDLE 5

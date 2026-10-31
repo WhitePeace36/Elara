@@ -84,6 +84,8 @@ struct task_ctx
   u64 run_avg;
   // when it last stopped running (see cache_hot())
   u64 stopped_at;
+  // its last wakeup was a sync one (see SYNC_PREEMPT_MIN_NS), set by select_cpu()
+  bool sync_wake;
 };
 
 struct dispatch_ctx
@@ -102,6 +104,10 @@ struct dispatch_ctx
   // not set)
   u64 slice_end;
   u64 timer_end;
+  // when the running task started (or got another slice), and its slack (see
+  // SYNC_PREEMPT_MIN_NS)
+  u64 running_since;
+  u64 running_slack;
   // weight of the task dispatch just put into the local DSQ of this cpu and
   // that hasn't started yet (see note_local())
   u64 local_weight;

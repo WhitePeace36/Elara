@@ -155,6 +155,18 @@ key, deadline and the rest of its slice. When several tasks wake for the same cp
 it switched, only an earlier one replaces the task already on its way in (on 7.1+ the
 kernel hands the replaced one back to elara), a later one queues up behind it.
 
+A sync wakeup (a pipe or socket write: the writer goes on or sleeps right after) onto the
+cpu of its waker doesn't preempt the waker in the first 500us of its run
+(`SYNC_PREEMPT_MIN_NS`), unless the woken task is more urgent (a shorter slack, a wake
+boost). Preempting at once, every message switched tasks: hackbench took 35-40s on the
+2-cpu test VM (EEVDF ~3s), with this rule 22s. A task woken onto another cpu preempts as
+before.
+
+SCHED_BATCH and SCHED_IDLE tasks are background work (ananicy-cpp, for example, marks
+compilers as batch): like with EEVDF, they never preempt the running task when they wake
+up, they don't get the shorter slack of a woken task and no wake boost. They still get
+their share by their nice value, at the end of the running task's slice.
+
 When the slice of a task runs out, its vtime is updated. It keeps running for another
 slice if its new key is not later than the key of the first queued task.
 
