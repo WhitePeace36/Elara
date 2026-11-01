@@ -437,10 +437,14 @@ static __always_inline s32 pick_other_llc(const struct task_struct* p, u32 cpu)
 // Cpu for a task that comes back after its slice: balanced by weight (see
 // RT_CPU_WEIGHT), at most once every BALANCE_INTERVAL_NS, unless its own cpu is
 // taken by an RT task.
-static __always_inline s32 pick_balance_cpu(struct task_struct* p, struct task_ctx* tctx, u64 slack, u32 cpu, u64 now)
+//
+// A global function, like pick_enqueue_cpu() (see there).
+__noinline s32 pick_balance_cpu(struct task_struct* p __arg_trusted, u64 slack, u32 cpu)
 {
-  if (p->nr_cpus_allowed == 1)
+  struct task_ctx* tctx = get_task_ctx(p);
+  if (!tctx || p->nr_cpus_allowed == 1)
     return cpu;
+  u64 now = bpf_ktime_get_ns();
 
   // The task that runs next on the cpu (the one in its local DSQ, otherwise
   // the head of its queue) only runs for a moment (its last run ended in sleep:
@@ -532,8 +536,19 @@ static __always_inline s32 pick_balance_cpu(struct task_struct* p, struct task_c
   return best;
 }
 
-static __always_inline s32 pick_enqueue_cpu(struct task_struct* p, struct task_ctx* tctx, s64 lag, u64 slack, u32 cpu, u64 now, bool wakeup)
+// Cpu for a woken or re-enqueued task: where it runs soonest, an idle one if
+// there is one (see cpu_load_ahead()).
+//
+// A global function: the verifier checks it once, not again for every way
+// enqueue() gets there. Inlined, with pick_balance_cpu() enqueue came to ~690k
+// of the verifier's limit (1M instructions) on 7.0 kernels with SMT and
+// several llcs (7.3: ~590k).
+__noinline s32 pick_enqueue_cpu(struct task_struct* p __arg_trusted, s64 lag, u64 slack, u32 cpu, bool wakeup)
 {
+  struct task_ctx* tctx = get_task_ctx(p);
+  if (!tctx)
+    return cpu;
+  u64 now = bpf_ktime_get_ns();
   u64 best_load = cpu_load_ahead(cpu, slack, lag, wakeup);
   if (best_load == 0)
   {
@@ -710,7 +725,10 @@ static __always_inline u64 dsq_first_takeable(u64 dsq, u32 cpu, u32 depth, bool 
 
 // Move the first task in @dsq that @cpu may take (among the first @depth) to the
 // local DSQ of @cpu.
-static __always_inline bool take_first_takeable(u64 dsq, u32 cpu, u32 depth, bool hot_ok, bool far)
+//
+// A global function, like find_earliest(): the verifier checks it once, not at
+// each of the five places dispatch takes a task from another cpu.
+__noinline int take_first_takeable(u64 dsq, u32 cpu, u32 depth, bool hot_ok, bool far)
 {
   far = far && dsq_queued(dsq) <= 1;
   struct task_struct* p;
@@ -739,9 +757,14 @@ static __always_inline bool take_first_takeable(u64 dsq, u32 cpu, u32 depth, boo
 
 // The cpu (of the cpus selected by @mode) whose queue has the task with the
 // earliest deadline that @cpu may take, -1 if there is none. Its deadline is
-// stored in @deadline. The scan starts at a random cpu, so of several tasks with
-// the same deadline a random one is taken.
-static __always_inline s32 find_earliest(u32 cpu, u32 mode, u64* deadline)
+// left in steal_scratch (see earliest_deadline()). The scan starts at a random
+// cpu, so of several tasks with the same deadline a random one is taken.
+//
+// A global function: the verifier checks it once, not again at each of the
+// five places dispatch calls it. Inlined, dispatch came to ~708k of the
+// verifier's limit (1M instructions) on 7.0 kernels with SMT, fast and slower
+// cores and several llcs (the verifier of 7.3 prunes better: ~204k).
+__noinline s32 find_earliest(u32 cpu, u32 mode)
 {
   u32 key = 0;
   struct steal_scratch* sc = bpf_map_lookup_elem(&steal_scratch_map, &key);
@@ -796,8 +819,15 @@ static __always_inline s32 find_earliest(u32 cpu, u32 mode, u64* deadline)
     }
   }
 
-  *deadline = sc->best_deadline;
   return sc->best_cpu;
+}
+
+// Deadline of the task the last find_earliest() of this cpu found.
+static __always_inline u64 earliest_deadline(void)
+{
+  u32 key = 0;
+  struct steal_scratch* sc = bpf_map_lookup_elem(&steal_scratch_map, &key);
+  return sc ? sc->best_deadline : DEADLINE_NONE;
 }
 
 // Rough weight of the tasks on @cpu other than @self: the running one and the
@@ -985,19 +1015,22 @@ static __always_inline u32 dispatch_dsq_per_cpu(u32 cpu, u64 prev_key, u64 prev_
   scan_stuck(now);
   if (nr_stuck_cpus)
   {
-    other = find_earliest(cpu, SCAN_STUCK_CPUS, &deadline);
+    other = find_earliest(cpu, SCAN_STUCK_CPUS);
+    deadline = earliest_deadline();
     if (other >= 0 && deadline < local_best && take_first_takeable(cpu_dsq((u32)other), cpu, RESCUE_SCAN_DEPTH, true, false))
       return DSP_TOOK;
   }
 
   if (nr_rt_busy)
   {
-    other = find_earliest(cpu, SCAN_RT_CPUS, &deadline);
+    other = find_earliest(cpu, SCAN_RT_CPUS);
+    deadline = earliest_deadline();
     if (other >= 0 && deadline < local_best && take_first_takeable(cpu_dsq((u32)other), cpu, RESCUE_SCAN_DEPTH, true, false))
       return DSP_TOOK;
     if (nr_llcs > 1)
     {
-      other = find_earliest(cpu, SCAN_RT_CPUS_OTHER_LLCS, &deadline);
+      other = find_earliest(cpu, SCAN_RT_CPUS_OTHER_LLCS);
+      deadline = earliest_deadline();
       if (other >= 0 && deadline < local_best && take_first_takeable(cpu_dsq((u32)other), cpu, RESCUE_SCAN_DEPTH, true, false))
         return DSP_TOOK;
     }
@@ -1027,13 +1060,13 @@ static __always_inline u32 dispatch_dsq_per_cpu(u32 cpu, u64 prev_key, u64 prev_
   if (prev_key != DEADLINE_NONE)
     return DSP_PREV;
 
-  other = find_earliest(cpu, SCAN_OWN_LLC, &deadline);
+  other = find_earliest(cpu, SCAN_OWN_LLC);
   if (other >= 0 && take_first_takeable(cpu_dsq((u32)other), cpu, STEAL_SCAN_DEPTH, may_take_hot((u32)other), false))
     return DSP_TOOK;
 
   if (nr_llcs > 1)
   {
-    other = find_earliest(cpu, SCAN_OTHER_LLCS, &deadline);
+    other = find_earliest(cpu, SCAN_OTHER_LLCS);
     if (other >= 0 && take_first_takeable(cpu_dsq((u32)other), cpu, STEAL_SCAN_DEPTH, may_take_hot((u32)other), true))
       return DSP_TOOK;
   }

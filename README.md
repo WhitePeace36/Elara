@@ -170,7 +170,11 @@ dispatch runs them by key. Treated like any re-enqueued task, they lost their
 preemption and waited up to the end of the running slice; under load (spinners and 60
 short tasks on 2 cpus) that happened ~55 times a second. They don't go into the local
 queue again: the kernel could hand them back again, and stops the scheduler after a
-few times.
+few times. The kernel also hands a woken task back when a realtime task takes its cpu
+first, or the cpu is switching to another task: then no task of elara runs there to
+preempt. An idle cpu runs it right away, otherwise it waits in the queue of its cpu,
+where the other cpus take it over while a realtime task keeps the cpu (in a test with
+realtime load, 8% of the hand-backs).
 
 A sync wakeup (a pipe or socket write: the writer goes on or sleeps right after) onto the
 cpu of its waker doesn't preempt the waker in the first 500us of its run
