@@ -10,6 +10,7 @@
 
 #define NS_PER_US 1000ULL
 #define NS_PER_MS (1000ULL * NS_PER_US)
+#define NS_PER_SEC (1000ULL * NS_PER_MS)
 
 // Slice of a task. A task that can't preempt (a task of the same urgency runs)
 // waits at most this long.
@@ -25,12 +26,20 @@
 #define RESUME_SLICE_MIN_NS (50 * NS_PER_US)
 
 // A task that runs for less than this per wakeup on average (and didn't use up
-// its last slice) gets no slice timer (see arm_slice_timer()): it sleeps before
-// its slice ends anyway. Each timer costs an irq_work interrupt to set it from
-// here and one more when it fires: on the test VM, a cpu bound thread sharing
-// its cpu with a task that ran 300us and slept 200us got ~4k more timer
-// interrupts in 7s than with EEVDF, now fewer. If such a task does run until
-// the end of its slice, the next tick ends it.
+// its last slice) gets no slice timer while only a cpu bound task waits for its
+// cpu (see arm_slice_timer()): it sleeps before its slice ends anyway. Each
+// timer costs an irq_work interrupt to set it from here and one more when it
+// fires: on the test VM, a cpu bound thread sharing its cpu with a task that ran
+// 300us and slept 200us got ~4k more timer interrupts in 7s than with EEVDF, now
+// fewer. If such a task does run until the end of its slice, the next tick ends
+// it: up to a tick later (1ms with HZ=1000, 3.3ms with 300, 10ms with 100).
+// With HZ=1000 that is no more than a slice, and a timer gained nothing on the
+// test VM (it cost ~250 interrupts a second more). With a slower tick, a task
+// that slept (a game or audio thread woken up) waiting behind it would lose
+// that much: then it gets the timer like any other task (see slow_tick()). With
+// HZ=250, nice 0 tasks waiting behind short nice 0 tasks that sometimes ran
+// 3ms: p99 2.0-2.5ms instead of 3.2-3.6ms, for ~300-470 interrupts a second
+// more on that cpu.
 #define BRIEF_RUN_NS (SLICE_NS / 2)
 
 // ---------------------------------------------------------------------------

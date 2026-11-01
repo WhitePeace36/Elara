@@ -24,6 +24,28 @@ static __always_inline bool tasks_waiting(u32 cpu)
   return dsq_queued(cpu_dsq(cpu)) || nr_rt_busy;
 }
 
+// Ticks per second of the kernel (its config, read by libbpf when loading), 0
+// if unknown.
+extern unsigned int CONFIG_HZ __kconfig __weak;
+
+// The scheduler tick comes later than the end of a slice (HZ below 1000, or
+// unknown): a task without a slice timer can run on for up to a tick after its
+// slice ended (see BRIEF_RUN_NS).
+static __always_inline bool slow_tick(void)
+{
+  return CONFIG_HZ < NS_PER_SEC / SLICE_NS;
+}
+
+// The first task waiting in the queue of @cpu slept before (a woken task, not
+// one that comes back after its slice): a task running there that only runs
+// for a moment gets a slice timer for it too (see BRIEF_RUN_NS).
+static __always_inline bool sleeper_waits(u32 cpu)
+{
+  struct task_struct* p = dsq_first(cpu_dsq(cpu));
+  struct task_ctx* tctx = p ? get_task_ctx(p) : NULL;
+  return tctx && !tctx->cpu_bound;
+}
+
 // The slice of the task running on cpu @key is over: if another task waits for
 // the cpu, end it now instead of at the next tick.
 static int slice_timer_fn(void* map, u32* key, struct elara_timer* st)
@@ -42,7 +64,17 @@ static int slice_timer_fn(void* map, u32* key, struct elara_timer* st)
   if (now < dctx->slice_end)
   {
     if (dctx->running_brief)
-      return 0;
+    {
+      if (!slow_tick())
+        return 0;
+      // scx_bpf_dsq_peek() needs an RCU read section, which a timer callback
+      // doesn't have by itself.
+      bpf_rcu_read_lock();
+      bool sleeper = sleeper_waits(cpu);
+      bpf_rcu_read_unlock();
+      if (!sleeper)
+        return 0;
+    }
     dctx->timer_end = dctx->slice_end;
     bpf_timer_start(&st->timer, dctx->slice_end - now, BPF_F_TIMER_CPU_PIN);
     return 0;
@@ -53,15 +85,17 @@ static int slice_timer_fn(void* map, u32* key, struct elara_timer* st)
 
 // Make sure the slice timer of @cpu fires at the end of the slice of its running
 // task. Only done when a task waits for the cpu: when the slice starts with a
-// non-empty queue, or when a task is queued behind the running one later.
+// non-empty queue, or when a task is queued behind the running one later. For
+// a running task that only runs for a moment (see BRIEF_RUN_NS) only when a
+// task that slept waits and the tick is slow (@sleeper, see slow_tick()).
 //
 // A timer still set for an earlier time (the end of an earlier slice, when tasks
 // switch faster than their slices end) is left alone: it goes on to the end of
 // the current slice when it fires. So it is started at most about once per
 // slice, not for every switch.
-static __always_inline void arm_slice_timer(u32 cpu, struct dispatch_ctx* dctx, u64 now)
+static __always_inline void arm_slice_timer(u32 cpu, struct dispatch_ctx* dctx, u64 now, bool sleeper)
 {
-  if (dctx->running_brief)
+  if (dctx->running_brief && !sleeper)
     return;
   u64 end = dctx->slice_end;
   if (dctx->timer_end > now && dctx->timer_end <= end)
@@ -81,7 +115,7 @@ static __always_inline void start_slice(u32 cpu, struct dispatch_ctx* dctx, u64 
 {
   dctx->slice_end = now + slice;
   if (tasks_waiting(cpu))
-    arm_slice_timer(cpu, dctx, now);
+    arm_slice_timer(cpu, dctx, now, dctx->running_brief && slow_tick() && sleeper_waits(cpu));
 }
 
 // An RT or deadline task has kept cpu @key - MAX_CPUS for RT_EVACUATE_DELAY_NS:
@@ -475,7 +509,7 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
       scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
     }
     else
-      arm_slice_timer(cpu, d, now);
+      arm_slice_timer(cpu, d, now, slow_tick() && !tctx->cpu_bound);
     return;
   }
   tctx->immed = false;
@@ -587,7 +621,7 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
     scx_bpf_kick_cpu(target, SCX_KICK_PREEMPT);
     return;
   }
-  arm_slice_timer(target, dctx, now);
+  arm_slice_timer(target, dctx, now, slow_tick() && !tctx->cpu_bound);
   // The running task stopped in the meantime, and its cpu may have looked for
   // a task before this one was queued: wake it. Otherwise it finds this task
   // when its running task stops. A kick always costs an irq_work interrupt

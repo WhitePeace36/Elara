@@ -147,7 +147,11 @@ right away. When nothing waits, no timer is set and the task just keeps running.
 for a task that runs for less than half a slice per wakeup on average
 (`BRIEF_RUN_NS`): it sleeps before its slice ends anyway, and setting the timer costs
 an interrupt (irq_work) and its expiry another. If it runs on for once, the next tick
-ends its slice. Kicks of idle cores (each an irq_work too) are left out where the core
+ends its slice: with HZ=1000 at most 1ms later, no more than a slice. With a slower tick
+(HZ=300: up to 3.3ms, HZ=100: 10ms; elara reads `CONFIG_HZ` from the kernel config
+when it loads) such a task still gets the timer while a task that slept waits for its
+core (a game or audio thread woken up), only not while just tasks that keep running
+wait. Kicks of idle cores (each an irq_work too) are left out where the core
 picks a task anyway.
 
 While an RT task runs on some core, the timer is set on the other cores too: tasks
