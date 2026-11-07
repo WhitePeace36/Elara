@@ -19,6 +19,10 @@ out.
 cmake (3.20 or newer) clang lld pkgconf libbpf bpf
 ```
 
+For the packages also `git` (the version comes from the commit), on Debian/Ubuntu
+`dpkg-dev` and on Fedora `rpm-build`. Package names differ a bit per distribution
+(`bpftool` instead of `bpf`, `libbpf-dev` / `libbpf-devel` for the headers).
+
 kernel compiled with flag `CONFIG_DEBUG_INFO_BTF=y`
 
 Linux 6.18 or newer. 6.19 or newer is recommended, 6.18 loses a part of the realtime
@@ -46,8 +50,12 @@ and background work at nice 5 or higher.
 ## Building it
 
 ```
-./build.sh
+cmake -B build
+cmake --build build
 ```
+
+This builds with clang in release mode (another compiler can be chosen with `CC` /
+`CXX`). The loader ends up in `build/elara`.
 
 `include/vmlinux.h` (the kernel types the BPF part is built against) comes with the
 repository. To build against the running kernel instead (Linux 7.3 or newer), run
@@ -60,14 +68,68 @@ The loader is built for any cpu of the architecture. To build it with `-march=na
 
 ## Installing
 
+elara is installed as a package of the distribution: the loader goes to `/usr/bin/elara`
+and its systemd unit to `/usr/lib/systemd/system/elara.service`. The package is written
+into the repository root.
+
+Arch Linux and derivatives (`PKGBUILD`), in the repository root:
+
 ```
-sudo ./install.sh
+makepkg -si
+```
+
+Fedora (`.rpm`) and Debian / Ubuntu (`.deb`), with CPack:
+
+```
+cmake -B build
+cmake --build build
+cpack --config build/CPackConfig.cmake
+```
+
+`cpack` builds the package of the distribution it runs on (`-G RPM` or `-G DEB` for a
+certain one). Then install it:
+
+```
+sudo dnf install ./elara-*.rpm      # Fedora
+sudo apt install ./elara_*.deb      # Debian / Ubuntu
+```
+
+Installing the package enables `elara.service` and starts it right away (and at every
+boot). An update of the package restarts a running elara and leaves the service enabled
+or disabled as it was.
+
+Only one sched_ext scheduler can be loaded at a time. `elara.service` conflicts with the
+services of the scx schedulers (`scx.service`, `scx_loader.service`): starting one stops
+the other. If one of them is enabled at boot, installing elara disables it (both would
+race at every boot otherwise), and removing elara enables it again. A scheduler started
+another way (by hand) keeps elara from loading: the service then tries again every 5
+seconds, and `journalctl -u elara.service` names the scheduler in the way.
+
+To go back to the kernel's own scheduler for a while:
+
+```
+sudo systemctl stop elara.service      # back to the kernel's scheduler
+sudo systemctl start elara.service     # elara again
+```
+
+Installed with the old `install.sh` before: remove those files first, otherwise the old
+unit in `/etc` takes precedence and keeps starting the old binary:
+
+```
+sudo systemctl disable --now elara.service
+sudo rm /etc/systemd/system/elara.service /usr/local/bin/elara
+sudo systemctl daemon-reload
 ```
 
 ## Uninstalling
 
+Removing the package stops and disables the service (and enables the scx services
+again that installing it disabled):
+
 ```
-sudo ./uninstall.sh
+sudo pacman -R elara      # Arch Linux
+sudo dnf remove elara     # Fedora
+sudo apt remove elara     # Debian / Ubuntu
 ```
 
 ## Explanation

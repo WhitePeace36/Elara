@@ -1,0 +1,11 @@
+post_install() {
+  /usr/lib/elara/elara-hook install
+}
+
+post_upgrade() {
+  /usr/lib/elara/elara-hook upgrade
+}
+
+pre_remove() {
+  /usr/lib/elara/elara-hook remove
+}

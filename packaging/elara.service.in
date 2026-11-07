@@ -1,0 +1,22 @@
+[Unit]
+Description=elara adaptive Linux scheduler (sched_ext)
+After=multi-user.target
+ConditionPathExists=/sys/kernel/sched_ext
+# Only one sched_ext scheduler can be loaded at a time: starting elara stops
+# the services of the scx schedulers (and starting one of them stops elara),
+# and elara starts only once they are stopped.
+Conflicts=scx.service scx_loader.service
+After=scx.service scx_loader.service
+# A scheduler loaded another way (started by hand) keeps elara from loading:
+# it tries again every 5s, up to 30 times in 5 minutes.
+StartLimitIntervalSec=300
+StartLimitBurst=30
+
+[Service]
+Type=simple
+ExecStart=@CMAKE_INSTALL_FULL_BINDIR@/elara
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

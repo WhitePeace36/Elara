@@ -1,2 +1,8 @@
 .qtcreator/*
 build/*
+# makepkg (PKGBUILD) and cpack output
+/src/
+/pkg/
+*.pkg.tar.*
+*.deb
+*.rpm

@@ -7,6 +7,8 @@
 #include <chrono>
 #include <thread>
 #include <string_view>
+#include <fstream>
+#include <string>
 
 typedef uint64_t u64;
 typedef int64_t s64;
@@ -40,6 +42,20 @@ enum class RunResult
   Restart,  // kernel asked for a restart (e.g. CPU hotplug)
   Failed,
 };
+
+// Name of the sched_ext scheduler loaded now, empty if none.
+static std::string loaded_scheduler()
+{
+  std::ifstream state("/sys/kernel/sched_ext/state");
+  std::string word;
+  if (!(state >> word) || word == "disabled")
+    return {};
+  std::ifstream ops("/sys/kernel/sched_ext/root/ops");
+  std::string name;
+  if (!std::getline(ops, name) || name.empty())
+    name = "unknown (" + word + ")";
+  return name;
+}
 
 static RunResult run_once()
 {
@@ -92,6 +108,12 @@ static RunResult run_once()
   if (err)
   {
     std::cerr << "Failed to attach BPF programs: " << err << std::endl;
+    // Only one sched_ext scheduler can be loaded at a time.
+    if (const std::string other = loaded_scheduler(); other == "scx_elara")
+      std::cerr << "elara is already running." << std::endl;
+    else if (!other.empty())
+      std::cerr << "Another sched_ext scheduler is loaded: " << other
+                << ". Stop it first (e.g. systemctl stop scx.service scx_loader.service)." << std::endl;
     elara_bpf__destroy(skel);
     // A cpu went on- or offline between reading the topology and attaching:
     // not a failure, just start again with the new topology.

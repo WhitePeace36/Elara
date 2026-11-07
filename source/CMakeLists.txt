@@ -9,6 +9,13 @@ set(BPF_HEADER
     ${CMAKE_CURRENT_SOURCE_DIR}/nice_weights.h
 )
 
+# Compiled to BPF_RAW_OBJ, then linked by bpftool into BPF_OBJ, which the
+# skeleton (and so the loader) embeds: the link keeps the BTF and line info
+# (verifier messages) but drops the DWARF debug info, ~1.2MB of the loader with
+# the paths of the build directory in it.
+set(BPF_RAW_OBJ
+    ${CMAKE_CURRENT_BINARY_DIR}/elara.bpf.raw.o
+)
 set(BPF_OBJ
     ${CMAKE_CURRENT_BINARY_DIR}/elara.bpf.o
 )
@@ -24,7 +31,7 @@ list(TRANSFORM BPF_LIBBPF_INCLUDES PREPEND "-idirafter")
 # The compiler writes a depfile, so the object is rebuilt whenever any included
 # header changes, in particular include/vmlinux.h after a kernel update.
 add_custom_command(
-    OUTPUT ${BPF_OBJ}
+    OUTPUT ${BPF_RAW_OBJ}
     COMMAND ${CLANG_EXECUTABLE}
         -target bpf -g -O2 -Wall -Wno-compare-distinct-pointer-types -mcpu=v3 -D__TARGET_ARCH_${BPF_TARGET_ARCH} -mlittle-endian
         -I${CMAKE_CURRENT_SOURCE_DIR}
@@ -32,12 +39,19 @@ add_custom_command(
         -I${CMAKE_SOURCE_DIR}/include
         ${BPF_LIBBPF_INCLUDES}
         ${LIBBPF_CFLAGS_OTHER}
-        -MD -MF ${BPF_OBJ}.d
-        -c ${BPF_SRC} -o ${BPF_OBJ}
+        -MD -MF ${BPF_RAW_OBJ}.d
+        -c ${BPF_SRC} -o ${BPF_RAW_OBJ}
     DEPENDS ${BPF_SRC}
             ${BPF_HEADER}
-    DEPFILE ${BPF_OBJ}.d
+    DEPFILE ${BPF_RAW_OBJ}.d
     COMMENT "Compiling BPF scheduler"
+    VERBATIM
+)
+add_custom_command(
+    OUTPUT ${BPF_OBJ}
+    COMMAND ${BPFTOOL_EXECUTABLE} gen object ${BPF_OBJ} ${BPF_RAW_OBJ}
+    DEPENDS ${BPF_RAW_OBJ}
+    COMMENT "Linking BPF scheduler"
     VERBATIM
 )
 
@@ -107,4 +121,4 @@ set_target_properties(elara PROPERTIES
 source_group(SourceFiles FILES ${elaraSource})
 source_group(HeaderFiles FILES ${elaraHeader})
 
-install(TARGETS elara RUNTIME DESTINATION bin)
+install(TARGETS elara RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

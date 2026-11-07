@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+# $2: the version configured before. dpkg also passes it after a remove without
+# purge (the package stays known until purged), so postrm marks a remove.
+if [ "$1" = configure ]; then
+    if [ -z "$2" ] || [ -f /var/lib/elara/removed ]; then
+        rm -f /var/lib/elara/removed
+        /usr/lib/elara/elara-hook install
+    else
+        /usr/lib/elara/elara-hook upgrade
+    fi
+fi
+exit 0

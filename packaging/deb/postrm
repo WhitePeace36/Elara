@@ -1,0 +1,15 @@
+#!/bin/sh
+set -e
+case "$1" in
+remove)
+    # Installing it again is a new installation (see postinst).
+    mkdir -p /var/lib/elara
+    touch /var/lib/elara/removed
+    [ -d /run/systemd/system ] && systemctl daemon-reload || true
+    ;;
+purge)
+    rm -f /var/lib/elara/removed
+    rmdir /var/lib/elara 2>/dev/null || true
+    ;;
+esac
+exit 0
