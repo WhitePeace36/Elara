@@ -427,9 +427,13 @@ static __always_inline s32 pick_other_llc(const struct task_struct* p, u32 cpu)
     return -1;
   // Until the next scan the move counts already, so the next task doesn't
   // follow on the same numbers. Not below 0: the numbers are from the last
-  // scan, the own llc may have lost tasks since.
+  // scan, the own llc may have lost tasks since. Only if the total is still
+  // the one read above: with three or more llcs two tasks can leave this llc
+  // for different ones at the same time, and both subtracting on the same
+  // old total wrapped it around (the llc then looked overloaded until the
+  // next scan). The one that loses just doesn't count, the next scan does.
   if (own_sum >= w)
-    __sync_fetch_and_add(&llc_load[mine], -w);
+    __sync_val_compare_and_swap(&llc_load[mine], own_sum, own_sum - w);
   __sync_fetch_and_add(&llc_load[other], w);
   return best;
 }

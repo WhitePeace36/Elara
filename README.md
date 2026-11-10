@@ -62,6 +62,11 @@ repository. To build against the running kernel instead (Linux 7.3 or newer), ru
 `./create_vmlinux.h.sh` first: the BPF part is rebuilt whenever that file (or any other
 included header) changed.
 
+The `include/vmlinux.h` of the repository is from an x86_64 kernel. On another
+architecture (aarch64) `./create_vmlinux.h.sh` has to be run first, on a machine of
+that architecture with Linux 7.3 or newer: cmake stops with a message otherwise. This
+also goes for `makepkg`.
+
 The loader is built for any cpu of the architecture. To build it with `-march=native`
 (the binary then only runs on cpus like the build machine), configure with
 `-DELARA_NATIVE_ARCH=ON`.

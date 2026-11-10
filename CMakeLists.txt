@@ -84,6 +84,22 @@ endif()
 
 message(STATUS "BPF target arch: ${BPF_TARGET_ARCH} (host: ${HOST_MACHINE_ARCH})")
 
+# The include/vmlinux.h of the repository is from an x86_64 kernel. The BPF part
+# doesn't compile against it for another architecture (the scx headers use
+# architecture specific types, e.g. struct thread_info), so say what to do
+# instead of failing somewhere in those headers. An x86 vmlinux.h is told by
+# the registers of its struct pt_regs.
+if(NOT BPF_TARGET_ARCH STREQUAL "x86")
+  file(STRINGS ${CMAKE_SOURCE_DIR}/include/vmlinux.h ELARA_VMLINUX_X86
+       REGEX "^[ \t]*unsigned long r15;" LIMIT_COUNT 1)
+  if(ELARA_VMLINUX_X86)
+    message(FATAL_ERROR
+      "include/vmlinux.h is from an x86_64 kernel, this is a ${HOST_MACHINE_ARCH} "
+      "build. Run ./create_vmlinux.h.sh on this machine first (needs Linux 7.3 "
+      "or newer and bpftool, see README.md), then configure again.")
+  endif()
+endif()
+
 
 add_subdirectory(source)
 

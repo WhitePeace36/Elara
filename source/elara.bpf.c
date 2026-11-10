@@ -421,6 +421,12 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
       scx_bpf_kick_cpu(up - 1, SCX_KICK_IDLE);
     note_local_bound(cpu, p);
     scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SLICE_NS, enq_flags);
+    // The cpu is already switching to the idle task (that is what
+    // SCX_ENQ_LAST says), and the kernel doesn't reschedule it for a task put
+    // into its local DSQ now: the scheduler has to. The kick takes effect
+    // once the cpu is idle and makes it pick the task; without it the task
+    // waited there until something else woke the cpu.
+    scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
     return;
   }
 
