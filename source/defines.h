@@ -286,6 +286,11 @@
 #define SCHED_DEADLINE 6
 #endif
 
+// States of dispatch_ctx.rt_busy (see set_rt_busy()).
+#define RT_BUSY_NO 0
+#define RT_BUSY_YES 1
+#define RT_BUSY_UNKNOWN 2
+
 // rt_priority of the per-cpu stopper threads (migration/N): MAX_RT_PRIO - 1,
 // see sched_set_stop_task() in kernel/sched/core.c.
 #define STOPPER_RT_PRIO 99

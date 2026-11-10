@@ -17,6 +17,11 @@ Type=simple
 ExecStart=@CMAKE_INSTALL_FULL_BINDIR@/elara
 Restart=on-failure
 RestartSec=5
+# Exit status 2: the kernel stopped elara for an error (a stall found by the
+# sched_ext watchdog, a runtime error). Loaded again it would likely end the
+# same way, so it stays stopped until it is started by hand or the next boot.
+# (Stopped by SysRq-S it exits with 0 and isn't restarted either.)
+RestartPreventExitStatus=2
 
 [Install]
 WantedBy=multi-user.target

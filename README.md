@@ -23,6 +23,16 @@ For the packages also `git` (the version comes from the commit), on Debian/Ubunt
 `dpkg-dev` and on Fedora `rpm-build`. Package names differ a bit per distribution
 (`bpftool` instead of `bpf`, `libbpf-dev` / `libbpf-devel` for the headers).
 
+The BPF part compiles with clang 18, the oldest version that was tried. bpftool has to
+be 7.5 or newer and libbpf 1.4 or newer (the loader sets fields of the scheduler through
+the skeleton, which older ones don't generate): the ones of Ubuntu 24.04 (bpftool 7.4,
+libbpf 1.3) are too old.
+
+The version of a package is the number of commits, so build packages from a full
+clone: in a shallow one (`git clone --depth 1`) the number is too low and the package
+looks older than an installed one (cmake warns about it, `git fetch --unshallow` gets
+the rest).
+
 kernel compiled with flag `CONFIG_DEBUG_INFO_BTF=y`
 
 Linux 6.18 or newer. 6.19 or newer is recommended, 6.18 loses a part of the realtime
@@ -108,7 +118,15 @@ services of the scx schedulers (`scx.service`, `scx_loader.service`): starting o
 the other. If one of them is enabled at boot, installing elara disables it (both would
 race at every boot otherwise), and removing elara enables it again. A scheduler started
 another way (by hand) keeps elara from loading: the service then tries again every 5
-seconds, and `journalctl -u elara.service` names the scheduler in the way.
+seconds, up to 30 times (about 2.5 minutes), and `journalctl -u elara.service` names the
+scheduler in the way. After that it stays stopped until `systemctl start elara.service`
+or the next boot.
+
+The service doesn't start elara again by itself when the kernel stopped it for an error
+(a stall found by the sched_ext watchdog, a runtime error: it would likely end the same
+way, `journalctl -u elara.service` has the kernel's report) or when it was stopped with
+SysRq-S. The kernel's own scheduler runs then, until `systemctl start elara.service` or
+the next boot.
 
 To go back to the kernel's own scheduler for a while:
 
@@ -510,7 +528,16 @@ There where 2 design goals for this scheduler.
 1. That music keeps playing normally when executing the cachyos benchmarker https://github.com/CachyOS/cachyos-benchmarker
 2. To keep frametimes as smooth as possible with as little frametime spikes as possible. 
 
-As far as i have tested. Both modes do accomplish these tasks very well.
+As far as i have tested, it does accomplish both very well.
+
+The detection of the topology (llcs, SMT, fast and slower cores) has tests that run on
+made-up cpus, without root:
+
+```
+cmake -B build -DELARA_BUILD_TESTS=ON
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
 
 The only problem is i couldn't test the functionality with different llcs as i don't have such an cpu by hand.
 The next thing is, that i mostly developed this scheduler with SMT disabled. As i found that SMT off works the best for this ryzen 5800x3d. But you can test both. Your mileage may vary.

@@ -150,6 +150,30 @@ static __always_inline bool cpu_taken_by_rt(u32 cpu)
   return curr && is_rt_task(curr);
 }
 
+// A sched_switch on the cpu of @dctx: its next task is an RT or deadline task
+// (@rt) or not. nr_rt_busy counts the cpus in state RT_BUSY_YES, so it follows
+// every change of the state, and both change atomically: elara_init() sets the
+// state of other cpus at the same time (init_rt_busy()).
+static __always_inline void set_rt_busy(struct dispatch_ctx* dctx, bool rt)
+{
+  u32 state = rt ? RT_BUSY_YES : RT_BUSY_NO;
+  u32 old = __sync_lock_test_and_set(&dctx->rt_busy, state);
+  if (rt && old != RT_BUSY_YES)
+    __sync_fetch_and_add(&nr_rt_busy, 1);
+  else if (!rt && old == RT_BUSY_YES)
+    __sync_fetch_and_sub(&nr_rt_busy, 1);
+}
+
+// elara_init() found the cpu of @dctx running an RT or deadline task (@rt) or
+// not. Only counts while no sched_switch was seen there (RT_BUSY_UNKNOWN): a
+// switch since then knows better, whichever of the two gets here first.
+static __always_inline void init_rt_busy(struct dispatch_ctx* dctx, bool rt)
+{
+  u32 state = rt ? RT_BUSY_YES : RT_BUSY_NO;
+  if (__sync_val_compare_and_swap(&dctx->rt_busy, RT_BUSY_UNKNOWN, state) == RT_BUSY_UNKNOWN && rt)
+    __sync_fetch_and_add(&nr_rt_busy, 1);
+}
+
 static __always_inline u64 elapsed(u64 now, u64 last)
 {
   return now > last ? now - last : 0;

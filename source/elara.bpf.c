@@ -125,7 +125,7 @@ static int rt_timer_fn(void* map, u32* key, struct elara_timer* st)
 {
   u32 cpu = *key - MAX_CPUS;
   struct dispatch_ctx* dctx = get_dispatch_ctx(cpu);
-  if (!dctx || !dctx->rt_busy || cpu != bpf_get_smp_processor_id())
+  if (!dctx || dctx->rt_busy != RT_BUSY_YES || cpu != bpf_get_smp_processor_id())
     return 0;
   if (dsq_queued(SCX_DSQ_LOCAL_ON | cpu))
     scx_bpf_reenqueue_local_from_anywhere();
@@ -148,8 +148,6 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(elara_init)
       return ret;
   }
 
-  // A cpu that already runs an RT task when the scheduler starts doesn't switch
-  // again until that task is done, so it is counted here.
   nr_rt_busy = 0;
   bpf_for(cpu, 0, nr_cpu_ids)
   {
@@ -167,6 +165,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(elara_init)
     dispatch_ctx->timer_end = 0;
     dispatch_ctx->local_weight = 0;
     dispatch_ctx->preempt_pending = false;
+    dispatch_ctx->rt_busy = RT_BUSY_UNKNOWN;
 
     u32 key = cpu & (MAX_CPUS - 1);
     struct elara_timer* st = bpf_map_lookup_elem(&slice_timers, &key);
@@ -189,17 +188,30 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(elara_init)
     ret = bpf_timer_set_callback(&st->timer, rt_timer_fn);
     if (ret)
       return ret;
+  }
 
+  // From here on the sched_switch tracepoint follows the cpus (the queues,
+  // contexts and timers it uses exist now).
+  elara_ready = true;
+
+  // A cpu that already runs an RT task when the scheduler starts doesn't switch
+  // again until that task is done, so it is counted here. Only after the
+  // tracepoint is on, and only for cpus that didn't switch since (see
+  // init_rt_busy()): looked at before, a switch in between was missed and the
+  // cpu counted as taken (or not) until its next one.
+  bpf_for(cpu, 0, nr_cpu_ids)
+  {
+    struct dispatch_ctx* dispatch_ctx = get_dispatch_ctx(cpu);
+    if (!dispatch_ctx)
+      return -ENOMEM;
     // scx_bpf_cpu_curr() needs an RCU read section, which a sleepable callback
     // doesn't have by itself.
     bpf_rcu_read_lock();
-    dispatch_ctx->rt_busy = cpu_is_online(cpu) && cpu_taken_by_rt(cpu);
+    bool rt = cpu_is_online(cpu) && cpu_taken_by_rt(cpu);
     bpf_rcu_read_unlock();
-    if (dispatch_ctx->rt_busy)
-      __sync_fetch_and_add(&nr_rt_busy, 1);
+    init_rt_busy(dispatch_ctx, rt);
   }
 
-  elara_ready = true;
   return 0;
 }
 
@@ -895,14 +907,8 @@ int BPF_PROG(elara_sched_switch, bool preempt, struct task_struct* prev, struct 
   struct dispatch_ctx* dctx = get_dispatch_ctx(cpu);
 
   bool rt = is_rt_task(next);
-  if (dctx && rt != dctx->rt_busy)
-  {
-    dctx->rt_busy = rt;
-    if (rt)
-      __sync_fetch_and_add(&nr_rt_busy, 1);
-    else
-      __sync_fetch_and_sub(&nr_rt_busy, 1);
-  }
+  if (dctx)
+    set_rt_busy(dctx, rt);
   if (!rt)
     return 0;
 

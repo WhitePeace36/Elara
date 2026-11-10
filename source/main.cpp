@@ -41,7 +41,14 @@ enum class RunResult
   Stopped,  // SIGINT/SIGTERM
   Restart,  // kernel asked for a restart (e.g. CPU hotplug)
   Failed,
+  // The kernel stopped the scheduler for an error (a stall found by the
+  // watchdog, a runtime error): loading it again would likely end the same way.
+  Ejected,
 };
+
+// Exit status for RunResult::Ejected: elara.service doesn't start elara again
+// after it (RestartPreventExitStatus=), unlike after other failures.
+constexpr int EXIT_EJECTED = 2;
 
 // Name of the sched_ext scheduler loaded now, empty if none.
 static std::string loaded_scheduler()
@@ -138,8 +145,29 @@ static RunResult run_once()
   RunResult result = RunResult::Stopped;
   if (ejected)
   {
-    u64 ecode = UEI_REPORT(skel, uei);
-    result = UEI_ECODE_RESTART(ecode) ? RunResult::Restart : RunResult::Failed;
+    const u64 kind = static_cast<u64>(skel->data->uei.kind);
+    const u64 ecode = UEI_REPORT(skel, uei);
+    // Values of the running kernel (0: it doesn't know that kind).
+    const u64 kind_sysrq = __COMPAT_ENUM_OR_ZERO("scx_exit_kind", "SCX_EXIT_SYSRQ");
+    const u64 kind_error = __COMPAT_ENUM_OR_ZERO("scx_exit_kind", "SCX_EXIT_ERROR");
+    if (UEI_ECODE_RESTART(ecode))
+      result = RunResult::Restart;
+    else if (kind_sysrq && kind == kind_sysrq)
+    {
+      // SysRq-S: somebody asked for the kernel's scheduler, usually because
+      // something went wrong. Not a failure, so the service stays stopped.
+      std::cerr << "elara: stopped by SysRq-S, not starting again (systemctl start elara.service does)." << std::endl;
+      result = RunResult::Stopped;
+    }
+    else if (kind_error && kind >= kind_error)
+    {
+      std::cerr << "elara: the kernel stopped the scheduler for an error (see above), not starting again "
+                   "(systemctl start elara.service does)."
+                << std::endl;
+      result = RunResult::Ejected;
+    }
+    else
+      result = RunResult::Failed;
   }
 
   elara_bpf__destroy(skel);
@@ -161,5 +189,7 @@ int main(int argc, const char** argv)
 
   std::cout << "Shutting down and restoring default kernel scheduler..." << std::endl;
 
+  if (result == RunResult::Ejected)
+    return EXIT_EJECTED;
   return result == RunResult::Failed ? 1 : 0;
 }

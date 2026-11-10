@@ -124,8 +124,9 @@ struct dispatch_ctx
   // the running one, until it starts (0: none)
   u64 preempt_key;
   bool preempt_pending;
-  // this cpu runs an RT or deadline task (as seen by the last sched_switch)
-  bool rt_busy;
+  // this cpu runs an RT or deadline task: RT_BUSY_NO, RT_BUSY_YES (as seen by
+  // the last sched_switch) or RT_BUSY_UNKNOWN (see set_rt_busy())
+  u32 rt_busy;
   // the running task is cpu bound (see task_ctx.cpu_bound), and so was the task
   // last put into the local DSQ (see note_local_bound())
   bool running_cpu_bound;
@@ -136,9 +137,9 @@ struct dispatch_ctx
   bool running_brief;
 };
 
-// Set at the end of elara_init(). The sched_switch tracepoint can run before:
-// the queues don't exist yet then (scx_bpf_dsq_peek() on them stops the
-// scheduler).
+// Set by elara_init() once the queues, contexts and timers exist. The
+// sched_switch tracepoint can run before: the queues don't exist yet then
+// (scx_bpf_dsq_peek() on them stops the scheduler).
 bool elara_ready;
 
 // Number of cpus an RT or deadline task runs on right now. Lets dispatch skip

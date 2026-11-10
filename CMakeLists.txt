@@ -38,6 +38,18 @@ if(GIT_FOUND AND EXISTS ${CMAKE_SOURCE_DIR}/.git)
   if(ELARA_GIT_COUNT AND ELARA_GIT_HASH)
     set(ELARA_VERSION 0.r${ELARA_GIT_COUNT}.g${ELARA_GIT_HASH})
   endif()
+  # A shallow clone (git clone --depth) doesn't have all commits: the count is
+  # too low, and the package manager takes the package for an older one than
+  # an installed one built from a full clone.
+  execute_process(COMMAND ${GIT_EXECUTABLE} rev-parse --is-shallow-repository
+                  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+                  OUTPUT_VARIABLE ELARA_GIT_SHALLOW OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+  if(ELARA_GIT_SHALLOW STREQUAL "true")
+    message(WARNING
+      "This is a shallow clone: the version ${ELARA_VERSION} counts only the commits "
+      "that were fetched, so a package built from it can look older than an "
+      "installed one. Run `git fetch --unshallow` before building a package.")
+  endif()
 endif()
 message(STATUS "elara version: ${ELARA_VERSION}")
 
@@ -102,5 +114,13 @@ endif()
 
 
 add_subdirectory(source)
+
+# Tests of the loader's topology detection (they need neither BPF nor root):
+#   cmake -B build -DELARA_BUILD_TESTS=ON && cmake --build build && ctest --test-dir build
+option(ELARA_BUILD_TESTS "Build the tests" OFF)
+if(ELARA_BUILD_TESTS)
+  enable_testing()
+  add_subdirectory(tests)
+endif()
 
 include(packaging/packaging.cmake)

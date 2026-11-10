@@ -805,7 +805,7 @@ __noinline s32 find_earliest(u32 cpu, u32 mode)
       if (mode == SCAN_RT_CPUS || mode == SCAN_RT_CPUS_OTHER_LLCS)
       {
         struct dispatch_ctx* other_ctx = get_dispatch_ctx(other);
-        if (!other_ctx || !other_ctx->rt_busy || !cpu_taken_by_rt(other))
+        if (!other_ctx || other_ctx->rt_busy != RT_BUSY_YES || !cpu_taken_by_rt(other))
           continue;
       }
     }

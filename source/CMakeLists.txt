@@ -30,13 +30,16 @@ list(TRANSFORM BPF_LIBBPF_INCLUDES PREPEND "-idirafter")
 
 # The compiler writes a depfile, so the object is rebuilt whenever any included
 # header changes, in particular include/vmlinux.h after a kernel update.
+# include/ (vmlinux.h and the headers taken over from scx) is searched as system
+# headers: their warnings can't be fixed here and hid the ones of our code. The
+# headers in source/ are found next to elara.bpf.c and still warn.
 add_custom_command(
     OUTPUT ${BPF_RAW_OBJ}
     COMMAND ${CLANG_EXECUTABLE}
         -target bpf -g -O2 -Wall -Wno-compare-distinct-pointer-types -mcpu=v3 -D__TARGET_ARCH_${BPF_TARGET_ARCH} -mlittle-endian
         -I${CMAKE_CURRENT_SOURCE_DIR}
-        -I${CMAKE_SOURCE_DIR}
-        -I${CMAKE_SOURCE_DIR}/include
+        -isystem ${CMAKE_SOURCE_DIR}
+        -isystem ${CMAKE_SOURCE_DIR}/include
         ${BPF_LIBBPF_INCLUDES}
         ${LIBBPF_CFLAGS_OTHER}
         -MD -MF ${BPF_RAW_OBJ}.d

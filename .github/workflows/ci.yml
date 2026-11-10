@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Arch Linux: the packages are current enough for the BPF part (clang,
+    # libbpf, bpftool), and it is what the PKGBUILD builds on.
+    container: archlinux:latest
+    steps:
+      - name: Install dependencies
+        run: pacman -Syu --noconfirm cmake make clang lld libbpf bpf pkgconf git shellcheck
+
+      - uses: actions/checkout@v4
+        with:
+          # all commits: the version of the packages is their number
+          fetch-depth: 0
+
+      - name: Trust the checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Configure
+        run: cmake -B build -DELARA_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Check the shell scripts
+        run: |
+          shellcheck --severity=warning create_vmlinux.h.sh packaging/elara-hook.sh packaging/deb/postinst packaging/deb/prerm packaging/deb/postrm
+          shellcheck --severity=warning --shell=sh packaging/rpm/post.sh packaging/rpm/preun.sh packaging/rpm/postun.sh
