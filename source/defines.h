@@ -256,9 +256,10 @@
 
 // When an RT or deadline task takes a cpu, the task it preempted (and the ones
 // already picked for the cpu) stay there for this long before they are placed
-// again on other cpus. Most RT tasks (irq threads, audio, the compositor) only
-// run for a moment: the preempted task then just continues, instead of losing
-// its place and being moved for nothing.
+// again on other cpus, and only then an idle cpu is woken for the tasks queued
+// there. Most RT tasks (irq threads, audio, the compositor) only run for a
+// moment: the preempted task then just continues, instead of losing its place
+// and being moved for nothing, and no idle cpu wakes up for nothing.
 #define RT_EVACUATE_DELAY_NS (250ULL * NS_PER_US)
 
 // Load a cpu taken by an RT or deadline task counts as. More than one task: a
@@ -294,6 +295,11 @@
 // rt_priority of the per-cpu stopper threads (migration/N): MAX_RT_PRIO - 1,
 // see sched_set_stop_task() in kernel/sched/core.c.
 #define STOPPER_RT_PRIO 99
+
+// Tasks with a priority (task_struct.prio) below this run in the RT or deadline
+// class: MAX_RT_PRIO of the kernel (include/linux/sched/prio.h), a macro and so
+// not part of vmlinux.h.
+#define MAX_RT_PRIO_ELARA 100
 
 #define MAX_CPUS 512
 

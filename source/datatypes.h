@@ -89,6 +89,12 @@ struct task_ctx
   bool rescued;
   // its last wakeup was a sync one (see SYNC_PREEMPT_MIN_NS), set by select_cpu()
   bool sync_wake;
+  // select_cpu() already decided the wake boost of this wakeup, until enqueue()
+  // (or running(), when select_cpu() put it straight into a local DSQ)
+  bool boost_checked;
+  // it called sched_yield() and another task took over its cpu, until it is
+  // queued again (enqueue()) or starts (running())
+  bool yield_pending;
   // woken and put into a local DSQ to run right away (to preempt, or onto an
   // idle cpu), until it starts (see reenq_immed())
   bool immed;
@@ -207,7 +213,8 @@ struct
 
 // Two timers per cpu: entry cpu ends the slice of the running task on time (see
 // SLICE_NS), entry MAX_CPUS + cpu moves the tasks picked for the cpu elsewhere
-// when an RT task keeps it (see RT_EVACUATE_DELAY_NS). Timers can't be kept in
+// and wakes an idle cpu for its queue when an RT task keeps it (see
+// RT_EVACUATE_DELAY_NS). Timers can't be kept in
 // per-cpu maps, so this is an array indexed by cpu.
 struct elara_timer
 {

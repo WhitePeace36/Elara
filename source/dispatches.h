@@ -18,13 +18,6 @@ static __always_inline u64 task_deadline(struct task_struct* p)
   return tctx ? tctx->deadline : DEADLINE_NONE;
 }
 
-// Deadline of the first task in @dsq, DEADLINE_NONE if it is empty.
-static __always_inline u64 dsq_head_deadline(u64 dsq)
-{
-  struct task_struct* p = dsq_first(dsq);
-  return p ? task_deadline(p) : DEADLINE_NONE;
-}
-
 // Key of the first task in @dsq, DEADLINE_NONE if it is empty.
 static __always_inline u64 dsq_head_key(u64 dsq)
 {
@@ -52,6 +45,16 @@ static __always_inline void queue_on(u32 cpu, u64 now)
   struct dispatch_ctx* dctx = get_dispatch_ctx(cpu);
   if (dctx && !dsq_queued(cpu_dsq(cpu)))
     dctx->last_progress = now;
+}
+
+// One of the cpus @p may run on is idle (and not claimed yet). One look at the
+// idle mask, before searches that go through the cpus one by one.
+static __always_inline bool idle_cpu_allowed(const struct task_struct* p)
+{
+  const struct cpumask* idle = scx_bpf_get_idle_cpumask();
+  bool any = bpf_cpumask_intersects(idle, p->cpus_ptr);
+  scx_bpf_put_idle_cpumask(idle);
+  return any;
 }
 
 // Claim an idle cpu @p may run on among the fast cpus (@fast) or the slower ones,
@@ -184,6 +187,13 @@ static __always_inline s32 llc_frees_soon(const struct task_struct* p, u32 cpu)
 // several llcs, now about half.
 __noinline s32 pick_idle(struct task_struct* p __arg_trusted, u32 cpu)
 {
+  // With every cpu busy, each of the searches below went through its cpus one
+  // by one for nothing, twice per task switch (pick_balance_cpu() and
+  // kick_idle_for_waiting()) and again for every wakeup. Without SMT, fast
+  // and slower cores or several llcs there is only the last one, a single
+  // look at the idle mask itself.
+  if ((hybrid || smt || nr_llcs > 1) && !idle_cpu_allowed(p))
+    return -1;
   const struct task_ctx* tctx = get_task_ctx(p);
   s32 c = claim_idle_preferred(p, tctx);
   if (c >= 0)
@@ -312,8 +322,9 @@ static __always_inline s32 better_cpu_alone(const struct task_struct* p, struct 
 // How much work would run on @cpu before a task queued there with @slack and
 // @lag (its key there: the vtime reference of @cpu + @lag + @slack, see
 // set_queue_keys()). @wakeup: the task is woken up and may preempt, decided
-// like enqueue() does: by key, with PREEMPT_MARGIN_NS.
-static __always_inline u64 cpu_load_ahead(u32 cpu, u64 slack, s64 lag, bool wakeup)
+// like enqueue() does: by key, with PREEMPT_MARGIN_NS. @now: the time, read
+// once by the caller for all cpus it looks at.
+static __always_inline u64 cpu_load_ahead(u32 cpu, u64 slack, s64 lag, bool wakeup, u64 now)
 {
   u64 load = 0;
   u64 key = cpu_vtime_ref(cpu) + lag + slack;
@@ -331,7 +342,7 @@ static __always_inline u64 cpu_load_ahead(u32 cpu, u64 slack, s64 lag, bool wake
   // A cpu taken by an RT or deadline task is busy for everything. Without this
   // it looks empty (stopping cleared running_deadline) and placement would even
   // prefer it when no cpu is idle. So is a stuck one.
-  else if (cpu_taken_by_rt(cpu) || cpu_stuck(cpu, bpf_ktime_get_ns()))
+  else if (cpu_taken_by_rt(cpu) || cpu_stuck(cpu, now))
     load += RT_CPU_LOAD;
 
   load += dsq_queued(SCX_DSQ_LOCAL_ON | cpu);
@@ -351,7 +362,7 @@ static __always_inline u64 cpu_load_ahead(u32 cpu, u64 slack, s64 lag, bool wake
 // Weight of the tasks on @cpu other than @self: the running one (an RT or
 // deadline task counts as RT_CPU_WEIGHT), the ones already picked for it and the
 // queued ones.
-static __always_inline u64 cpu_weight_load(u32 cpu, struct task_struct* self)
+static __always_inline u64 cpu_weight_load(u32 cpu, struct task_struct* self, u64 now)
 {
   u64 load = 0;
   u32 summed = 0;
@@ -363,7 +374,7 @@ static __always_inline u64 cpu_weight_load(u32 cpu, struct task_struct* self)
     if (curr != self)
       load += is_rt_task(curr) ? RT_CPU_WEIGHT : task_weight(curr);
   }
-  else if (cpu_stuck(cpu, bpf_ktime_get_ns()))
+  else if (cpu_stuck(cpu, now))
     load += RT_CPU_WEIGHT;
 
   // The tasks already picked for the cpu count as nice 0, except the one the
@@ -503,27 +514,33 @@ __noinline s32 pick_balance_cpu(struct task_struct* p __arg_trusted, u64 slack, 
 
   bool rotate = now - tctx->turns_since >= ROTATE_NS;
   u64 margin = task_weight(p) / 2;
-  sc->best_load = capacity_load(cpu_weight_load(cpu, p), cpu);
+  sc->best_load = capacity_load(cpu_weight_load(cpu, p, now), cpu);
   sc->best = cpu;
   sc->sampled = 0;
   if (sc->best_load == 0)
     return cpu;
 
-  u32 my_llc = cpu_llc_id(cpu);
-  u32 nr_cpu_ids = scx_bpf_nr_cpu_ids();
-  u32 start = bpf_get_prandom_u32() % nr_cpu_ids;
-  u32 budget = scan_whole_llc ? nr_cpu_ids : BALANCE_SAMPLES;
+  // The cpus of the llc from its list (llc_cpus, only online ones), starting
+  // at a random one: not all cpu ids with those of other llcs skipped.
+  u32 my_llc = cpu_llc_id(cpu) & (MAX_CPUS - 1);
+  u32 base = llc_start[my_llc];
+  u32 nr = llc_len[my_llc];
+  if (!nr)
+    return cpu;
+  u32 off = bpf_get_prandom_u32() % nr;
+  u32 budget = scan_whole_llc ? nr : BALANCE_SAMPLES;
   u32 i;
 
-  bpf_for(i, 0, nr_cpu_ids)
+  bpf_for(i, 0, nr)
   {
-    u32 other = (start + i) % nr_cpu_ids;
-    if (other == cpu || cpu_llc_id(other) != my_llc || !cpu_is_online(other))
-      continue;
-    if (!bpf_cpumask_test_cpu(other, p->cpus_ptr))
+    u32 idx = off + i;
+    if (idx >= nr)
+      idx -= nr;
+    u32 other = llc_cpus[(base + idx) & (MAX_CPUS - 1)];
+    if (other == cpu || !bpf_cpumask_test_cpu(other, p->cpus_ptr))
       continue;
 
-    u64 load = capacity_load(cpu_weight_load(other, p), other);
+    u64 load = capacity_load(cpu_weight_load(other, p, now), other);
     if (load + margin < sc->best_load || (rotate && (u32)sc->best == cpu && load <= sc->best_load + margin))
     {
       sc->best_load = load;
@@ -553,7 +570,7 @@ __noinline s32 pick_enqueue_cpu(struct task_struct* p __arg_trusted, s64 lag, u6
   if (!tctx)
     return cpu;
   u64 now = bpf_ktime_get_ns();
-  u64 best_load = cpu_load_ahead(cpu, slack, lag, wakeup);
+  u64 best_load = cpu_load_ahead(cpu, slack, lag, wakeup, now);
   if (best_load == 0)
   {
     s32 better = better_idle(p, tctx, cpu);
@@ -612,21 +629,26 @@ __noinline s32 pick_enqueue_cpu(struct task_struct* p __arg_trusted, s64 lag, u6
   sc->best = cpu;
   sc->sampled = 0;
 
-  u32 my_llc = cpu_llc_id(cpu);
-  u32 nr_cpu_ids = scx_bpf_nr_cpu_ids();
-  u32 start = bpf_get_prandom_u32() % nr_cpu_ids;
-  u32 budget = scan_whole_llc ? nr_cpu_ids : BALANCE_SAMPLES;
+  // The cpus of the llc from its list, like pick_balance_cpu().
+  u32 my_llc = cpu_llc_id(cpu) & (MAX_CPUS - 1);
+  u32 base = llc_start[my_llc];
+  u32 nr = llc_len[my_llc];
+  if (!nr)
+    return cpu;
+  u32 off = bpf_get_prandom_u32() % nr;
+  u32 budget = scan_whole_llc ? nr : BALANCE_SAMPLES;
   u32 i;
 
-  bpf_for(i, 0, nr_cpu_ids)
+  bpf_for(i, 0, nr)
   {
-    u32 other = (start + i) % nr_cpu_ids;
-    if (other == cpu || cpu_llc_id(other) != my_llc || !cpu_is_online(other))
-      continue;
-    if (!bpf_cpumask_test_cpu(other, p->cpus_ptr))
+    u32 idx = off + i;
+    if (idx >= nr)
+      idx -= nr;
+    u32 other = llc_cpus[(base + idx) & (MAX_CPUS - 1)];
+    if (other == cpu || !bpf_cpumask_test_cpu(other, p->cpus_ptr))
       continue;
 
-    u64 load = cpu_load_ahead(other, slack, lag, wakeup);
+    u64 load = cpu_load_ahead(other, slack, lag, wakeup, now);
     if (load < sc->best_load)
     {
       sc->best_load = load;
@@ -649,12 +671,11 @@ __noinline s32 pick_enqueue_cpu(struct task_struct* p __arg_trusted, s64 lag, u6
 // Dispatch
 // ---------------------------------------------------------------------------
 
-// @p ran until a moment ago (STEAL_HOT_NS): it gets its cpu back soon, with its
-// cache still warm there.
-static __always_inline bool cache_hot(struct task_struct* p)
+// @tctx's task ran until a moment ago (STEAL_HOT_NS): it gets its cpu back soon,
+// with its cache still warm there.
+static __always_inline bool cache_hot(const struct task_ctx* tctx, u64 now)
 {
-  struct task_ctx* tctx = get_task_ctx(p);
-  return tctx && elapsed(bpf_ktime_get_ns(), tctx->stopped_at) < STEAL_HOT_NS;
+  return tctx && elapsed(now, tctx->stopped_at) < STEAL_HOT_NS;
 }
 
 // With SMT: the other cpu of the core of @cpu runs a cpu bound task (or an RT
@@ -680,14 +701,16 @@ static __always_inline bool sibling_busy(u32 cpu)
 // (a shell command) next to 4 spinners on 4 cores put two of them on one core
 // half of the time, and the SMT hand-back (better_cpu_alone()) moved one back a
 // few ms later, ~100 times a second.
-static __always_inline bool can_take(struct task_struct* p, u32 cpu, bool hot_ok, bool far)
+//
+// @now: the time, read once by the caller for all tasks it looks at.
+static __always_inline bool can_take(struct task_struct* p, u32 cpu, bool hot_ok, bool far, u64 now)
 {
   if (is_migration_disabled(p) || !bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
     return false;
   if (hot_ok)
     return true;
   struct task_ctx* tctx = get_task_ctx(p);
-  if (cache_hot(p) || (far && runs_short(tctx)))
+  if (cache_hot(tctx, now) || (far && runs_short(tctx)))
     return false;
   return !(tctx && tctx->cpu_bound && sibling_busy(cpu));
 }
@@ -706,7 +729,7 @@ static __always_inline bool may_take_hot(u32 other)
 
 // Deadline of the first task in @dsq that @cpu may take, DEADLINE_NONE if there
 // is none among the first @depth tasks.
-static __always_inline u64 dsq_first_takeable(u64 dsq, u32 cpu, u32 depth, bool hot_ok, bool far)
+static __always_inline u64 dsq_first_takeable(u64 dsq, u32 cpu, u32 depth, bool hot_ok, bool far, u64 now)
 {
   far = far && dsq_queued(dsq) <= 1;
   struct task_struct* p = dsq_first(dsq);
@@ -714,12 +737,12 @@ static __always_inline u64 dsq_first_takeable(u64 dsq, u32 cpu, u32 depth, bool 
 
   if (!p)
     return DEADLINE_NONE;
-  if (can_take(p, cpu, hot_ok, far))
+  if (can_take(p, cpu, hot_ok, far, now))
     return task_deadline(p);
 
   bpf_for_each(scx_dsq, p, dsq, 0)
   {
-    if (can_take(p, cpu, hot_ok, far))
+    if (can_take(p, cpu, hot_ok, far, now))
       return task_deadline(p);
     if (++looked >= depth)
       break;
@@ -737,10 +760,12 @@ __noinline int take_first_takeable(u64 dsq, u32 cpu, u32 depth, bool hot_ok, boo
   far = far && dsq_queued(dsq) <= 1;
   struct task_struct* p;
   u32 looked = 0;
+  // Read here: a global function takes at most five arguments.
+  u64 now = bpf_ktime_get_ns();
 
   bpf_for_each(scx_dsq, p, dsq, 0)
   {
-    if (can_take(p, cpu, hot_ok, far))
+    if (can_take(p, cpu, hot_ok, far, now))
     {
       if (!scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, SCX_DSQ_LOCAL, 0))
         return false;
@@ -778,15 +803,24 @@ __noinline s32 find_earliest(u32 cpu, u32 mode)
   sc->best_deadline = DEADLINE_NONE;
   sc->best_cpu = -1;
 
-  u32 my_llc = cpu_llc_id(cpu);
-  u32 nr_cpu_ids = scx_bpf_nr_cpu_ids();
-  u32 start = bpf_get_prandom_u32() % nr_cpu_ids;
-  u64 now = mode == SCAN_STUCK_CPUS ? bpf_ktime_get_ns() : 0;
+  // The scans of the own llc go through its list of cpus (llc_cpus, only
+  // online ones), the others through all cpu ids.
+  u32 my_llc = cpu_llc_id(cpu) & (MAX_CPUS - 1);
+  bool own_llc = mode == SCAN_RT_CPUS || mode == SCAN_OWN_LLC;
+  u32 base = own_llc ? llc_start[my_llc] : 0;
+  u32 nr = own_llc ? llc_len[my_llc] : scx_bpf_nr_cpu_ids();
+  if (!nr)
+    return -1;
+  u32 off = bpf_get_prandom_u32() % nr;
+  u64 now = bpf_ktime_get_ns();
   u32 i;
 
-  bpf_for(i, 0, nr_cpu_ids)
+  bpf_for(i, 0, nr)
   {
-    u32 other = (start + i) % nr_cpu_ids;
+    u32 idx = off + i;
+    if (idx >= nr)
+      idx -= nr;
+    u32 other = own_llc ? llc_cpus[(base + idx) & (MAX_CPUS - 1)] : idx;
     if (other == cpu || !cpu_is_online(other))
       continue;
 
@@ -797,9 +831,7 @@ __noinline s32 find_earliest(u32 cpu, u32 mode)
     }
     else
     {
-      bool same_llc = cpu_llc_id(other) == my_llc;
-      bool other_llcs = mode == SCAN_OTHER_LLCS || mode == SCAN_RT_CPUS_OTHER_LLCS;
-      if (other_llcs ? same_llc : !same_llc)
+      if (!own_llc && cpu_llc_id(other) == my_llc)
         continue;
 
       if (mode == SCAN_RT_CPUS || mode == SCAN_RT_CPUS_OTHER_LLCS)
@@ -815,7 +847,7 @@ __noinline s32 find_earliest(u32 cpu, u32 mode)
       continue;
 
     bool rescue = mode == SCAN_STUCK_CPUS || mode == SCAN_RT_CPUS || mode == SCAN_RT_CPUS_OTHER_LLCS;
-    u64 d = dsq_first_takeable(dsq, cpu, rescue ? RESCUE_SCAN_DEPTH : STEAL_SCAN_DEPTH, rescue || may_take_hot(other), mode == SCAN_OTHER_LLCS);
+    u64 d = dsq_first_takeable(dsq, cpu, rescue ? RESCUE_SCAN_DEPTH : STEAL_SCAN_DEPTH, rescue || may_take_hot(other), mode == SCAN_OTHER_LLCS, now);
     if (d < sc->best_deadline)
     {
       sc->best_deadline = d;
@@ -838,7 +870,7 @@ static __always_inline u64 earliest_deadline(void)
 // queued ones as nice 0 (cpu_weight_load() sums them up exactly, too costly for
 // all cpus of two llcs). A cpu taken by an RT task or stuck counts as
 // RT_CPU_WEIGHT.
-static __always_inline u64 cpu_rough_load(u32 cpu, struct task_struct* self)
+static __always_inline u64 cpu_rough_load(u32 cpu, struct task_struct* self, u64 now)
 {
   u64 load = 0;
   struct task_struct* curr = __COMPAT_scx_bpf_cpu_curr(cpu);
@@ -847,7 +879,7 @@ static __always_inline u64 cpu_rough_load(u32 cpu, struct task_struct* self)
     if (curr != self)
       load += is_rt_task(curr) ? RT_CPU_WEIGHT : task_weight(curr);
   }
-  else if (cpu_stuck(cpu, bpf_ktime_get_ns()))
+  else if (cpu_stuck(cpu, now))
     load += RT_CPU_WEIGHT;
   u64 queued = dsq_queued(cpu_dsq(cpu)) + dsq_queued(SCX_DSQ_LOCAL_ON | cpu);
   return load + queued * NICE_0_WEIGHT;
@@ -856,7 +888,7 @@ static __always_inline u64 cpu_rough_load(u32 cpu, struct task_struct* self)
 // With several llcs, add up the rough weight per llc (see cpu_rough_load()) for
 // pick_other_llc(), with the scan for stuck cpus: once per interval for the
 // whole system.
-static __always_inline void llc_scan(void)
+static __always_inline void llc_scan(u64 now)
 {
   u32 nr_cpu_ids = scx_bpf_nr_cpu_ids();
   u32 i;
@@ -874,7 +906,7 @@ static __always_inline void llc_scan(void)
     if (!cpu_is_online(c))
       continue;
     u32 l = cpu_llc_id(c) & (MAX_CPUS - 1);
-    u64 load = capacity_load(cpu_rough_load(c, NULL), c);
+    u64 load = capacity_load(cpu_rough_load(c, NULL, now), c);
     // A task alone on its cpu can't use more than that cpu, however heavy it
     // is: in the total it counts as at most nice 0. Otherwise a nice -5 task
     // made its llc look as full as one with twice as many nice 0 tasks, and the
@@ -899,10 +931,45 @@ static __always_inline void llc_scan(void)
   }
 }
 
+// Wake an idle cpu for the first task waiting in the queue of @cpu, if it may run
+// elsewhere (not pinned to the cpu, also not for the moment by migrate_disable()).
+static __always_inline void kick_idle_for_waiting(u32 cpu)
+{
+  struct task_struct* p = dsq_first(cpu_dsq(cpu));
+
+  if (p && p->nr_cpus_allowed > 1 && !is_migration_disabled(p))
+  {
+    s32 idle = pick_idle(p, cpu);
+    if (idle >= 0)
+      scx_bpf_kick_cpu(idle, SCX_KICK_IDLE);
+  }
+}
+
+// A task boosted by priority inheritance while it runs (it holds a lock an RT
+// task waits for) moves to the RT class without a context switch, and so does
+// it back when the boost ends: the sched_switch tracepoint sees neither. Its
+// cpu didn't count as taken by an RT task (nr_rt_busy, dispatch step 1) until
+// it switched tasks or counted as stuck (STUCK_NS), and the tasks queued there
+// waited. Looked at for every cpu by scan_stuck(). Not before elara_init()
+// counted the cpu (RT_BUSY_UNKNOWN, see init_rt_busy()).
+static __always_inline void sync_rt_busy(u32 cpu)
+{
+  struct dispatch_ctx* d = get_dispatch_ctx(cpu);
+  if (!d || d->rt_busy == RT_BUSY_UNKNOWN)
+    return;
+  bool rt = cpu_taken_by_rt(cpu);
+  if (rt == (d->rt_busy == RT_BUSY_YES))
+    return;
+  set_rt_busy(d, rt);
+  if (rt)
+    kick_idle_for_waiting(cpu);
+}
+
 // Every STUCK_CHECK_INTERVAL_NS one cpu (the first to get here) looks for stuck
 // cpus (see STUCK_NS) and marks them in stuck_cpu, nr_stuck_cpus tells the others
 // whether to look there: one scan of all cpus per interval for the whole system,
-// not one per cpu.
+// not one per cpu. It also catches cpus that changed to or from an RT task
+// without a context switch (sync_rt_busy()).
 static __always_inline void scan_stuck(u64 now)
 {
   u64 last = stuck_scan_at;
@@ -919,13 +986,16 @@ static __always_inline void scan_stuck(u64 now)
   bpf_for(i, 0, nr_cpu_ids)
   {
     u32 c = i & (MAX_CPUS - 1);
-    bool stuck = cpu_is_online(c) && cpu_stuck(c, now);
+    bool online = cpu_is_online(c);
+    bool stuck = online && cpu_stuck(c, now);
     stuck_cpu[c] = stuck;
     if (stuck)
       nr_stuck_cpus++;
+    if (online)
+      sync_rt_busy(c);
   }
   if (nr_llcs > 1)
-    llc_scan();
+    llc_scan(now);
 }
 
 // Run a task of the own queue that is more than STARVE_GRACE_NS past its
@@ -963,11 +1033,13 @@ static __always_inline bool take_overdue(struct dispatch_ctx* dctx, u64 dsq, u64
       // task_lag()): heavy tasks (small limit) lost their place, light ones
       // (large limit) kept early keys. Under overload (5 nice -20 tasks
       // per cpu) nice 10 tasks got more than nice -10 ones.
+      // Marked only once it is in the local DSQ: if another cpu got it
+      // first, the mark stayed for its next (normal) run.
       struct task_ctx* rctx = get_task_ctx(p);
-      if (rctx)
-        rctx->rescued = true;
       if (!scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, SCX_DSQ_LOCAL, 0))
         return false;
+      if (rctx)
+        rctx->rescued = true;
       note_local(bpf_get_smp_processor_id(), p);
       return true;
     }
@@ -1001,21 +1073,31 @@ static __always_inline bool take_overdue(struct dispatch_ctx* dctx, u64 dsq, u64
 //
 // Returns DSP_TOOK when a task was put into the local DSQ, DSP_PREV when prev
 // keeps running, DSP_NONE when there is nothing to run.
+//
+// @yielded: prev called sched_yield(). Then the head of the own queue runs
+// next whatever its key (step 3); with nothing queued prev goes on, no task is
+// taken from another cpu for it.
 #define DSP_TOOK 0
 #define DSP_PREV 1
 #define DSP_NONE 2
-static __always_inline u32 dispatch_dsq_per_cpu(u32 cpu, u64 prev_key, u64 prev_deadline)
+static __always_inline u32 dispatch_dsq_per_cpu(u32 cpu, struct dispatch_ctx* dctx, u64 now, u64 prev_key, u64 prev_deadline, bool yielded)
 {
   u64 own_dsq = cpu_dsq(cpu);
-  u64 own_key = dsq_head_key(own_dsq);
   u64 deadline;
   s32 other;
 
-  u64 own_deadline = dsq_head_deadline(own_dsq);
+  // The head of the own queue, looked at once: its key and deadline, and what
+  // note_local() keeps of it when it is the task that runs next (step 3). If
+  // another task gets in front of it until then, those are a little off for
+  // one slice (they only guide balancing).
+  struct task_struct* head = dsq_first(own_dsq);
+  struct task_ctx* hctx = head ? get_task_ctx(head) : NULL;
+  u64 own_key = head ? head->scx.dsq_vtime : DEADLINE_NONE;
+  u64 own_deadline = hctx ? hctx->deadline : DEADLINE_NONE;
+  u64 head_weight = head ? task_weight(head) : NICE_0_WEIGHT;
+  bool head_cpu_bound = !hctx || hctx->cpu_bound;
   u64 local_best = own_deadline < prev_deadline ? own_deadline : prev_deadline;
 
-  struct dispatch_ctx* dctx = get_dispatch_ctx(cpu);
-  u64 now = bpf_ktime_get_ns();
   scan_stuck(now);
   if (nr_stuck_cpus)
   {
@@ -1043,19 +1125,15 @@ static __always_inline u32 dispatch_dsq_per_cpu(u32 cpu, u64 prev_key, u64 prev_
   if (take_overdue(dctx, own_dsq, now))
     return DSP_TOOK;
 
-  if (prev_key != DEADLINE_NONE && (own_key == DEADLINE_NONE || !key_before(own_key, prev_key)))
+  if (prev_key != DEADLINE_NONE && (own_key == DEADLINE_NONE || (!yielded && !key_before(own_key, prev_key))))
     return DSP_PREV;
   if (own_key != DEADLINE_NONE)
   {
-    struct task_struct* head = dsq_first(own_dsq);
-    u64 w = head ? task_weight(head) : NICE_0_WEIGHT;
-    struct task_ctx* hctx = head ? get_task_ctx(head) : NULL;
-    bool head_cpu_bound = !hctx || hctx->cpu_bound;
     if (scx_bpf_dsq_move_to_local(own_dsq, 0))
     {
       if (dctx)
       {
-        dctx->local_weight = w;
+        dctx->local_weight = head_weight;
         dctx->local_cpu_bound = head_cpu_bound;
       }
       return DSP_TOOK;
@@ -1076,20 +1154,6 @@ static __always_inline u32 dispatch_dsq_per_cpu(u32 cpu, u64 prev_key, u64 prev_
   }
 
   return DSP_NONE;
-}
-
-// Wake an idle cpu for the first task waiting in the queue of @cpu, if it may run
-// elsewhere (not pinned to the cpu, also not for the moment by migrate_disable()).
-static __always_inline void kick_idle_for_waiting(u32 cpu)
-{
-  struct task_struct* p = dsq_first(cpu_dsq(cpu));
-
-  if (p && p->nr_cpus_allowed > 1 && !is_migration_disabled(p))
-  {
-    s32 idle = pick_idle(p, cpu);
-    if (idle >= 0)
-      scx_bpf_kick_cpu(idle, SCX_KICK_IDLE);
-  }
 }
 
 #endif  // DISPATCHES_H

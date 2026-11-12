@@ -118,9 +118,12 @@ static __always_inline void start_slice(u32 cpu, struct dispatch_ctx* dctx, u64 
     arm_slice_timer(cpu, dctx, now, dctx->running_brief && slow_tick() && sleeper_waits(cpu));
 }
 
+// The kernel is built with PREEMPT_RT (read by libbpf when loading).
+extern bool CONFIG_PREEMPT_RT __kconfig __weak;
+
 // An RT or deadline task has kept cpu @key - MAX_CPUS for RT_EVACUATE_DELAY_NS:
 // the tasks picked for it go back through enqueue(), which places them on
-// other cpus.
+// other cpus, and an idle cpu is woken for the first task of its queue.
 static int rt_timer_fn(void* map, u32* key, struct elara_timer* st)
 {
   u32 cpu = *key - MAX_CPUS;
@@ -129,6 +132,11 @@ static int rt_timer_fn(void* map, u32* key, struct elara_timer* st)
     return 0;
   if (dsq_queued(SCX_DSQ_LOCAL_ON | cpu))
     scx_bpf_reenqueue_local_from_anywhere();
+  // scx_bpf_dsq_peek() needs an RCU read section, which a timer callback
+  // doesn't have by itself.
+  bpf_rcu_read_lock();
+  kick_idle_for_waiting(cpu);
+  bpf_rcu_read_unlock();
   return 0;
 }
 
@@ -250,12 +258,13 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(elara_init_task, struct task_struct* p, struct scx_
   tctx->run_avg = SHORT_RUN_NS;
   tctx->stopped_at = 0;
   tctx->rescued = false;
+  tctx->sync_wake = false;
+  tctx->boost_checked = false;
+  tctx->yield_pending = false;
   tctx->immed = false;
 
   return 0;
 }
-
-void BPF_STRUCT_OPS(elara_exit_task, struct task_struct* p, struct scx_exit_task_args* args) { }
 
 // The task that wakes @p, NULL if there is none: the wakeup comes from an
 // interrupt (the current task is just the one that was interrupted), from the
@@ -342,14 +351,22 @@ s32 BPF_STRUCT_OPS(elara_select_cpu, struct task_struct* p, s32 prev_cpu, u64 wa
   struct task_ctx* tctx = get_task_ctx(p);
 
   if (tctx && (wake_flags & SCX_WAKE_TTWU))
+  {
     apply_wake_boost(p, tctx);
+    tctx->boost_checked = true;
+  }
   if (tctx)
     tctx->sync_wake = wake_flags & SCX_WAKE_SYNC;
 
   // With fast and slower cores: an idle cpu of the kind the task prefers, its
   // previous one if that is such a cpu and idle.
   s32 cpu = -1;
-  if (hybrid && tctx && p->nr_cpus_allowed > 1)
+  // No idle cpu @p may run on: the searches below would go through their cpus
+  // one by one for nothing (see pick_idle()). Only looked at when one of them
+  // can run: with one llc and all cores equally fast it was one more look at
+  // the idle mask for every wakeup, for nothing.
+  bool any_idle = (hybrid || nr_llcs > 1) && idle_cpu_allowed(p);
+  if (hybrid && tctx && p->nr_cpus_allowed > 1 && any_idle)
   {
     bool fast = wants_fast_core(p, tctx);
     if ((fast || wants_slow_core(p, tctx)) && cpu_is_fast(prev_cpu) == fast && bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
@@ -376,7 +393,8 @@ s32 BPF_STRUCT_OPS(elara_select_cpu, struct task_struct* p, s32 prev_cpu, u64 wa
     s32 this_cpu = bpf_get_smp_processor_id();
     if (waker && bpf_cpumask_test_cpu(this_cpu, p->cpus_ptr) && runs_short(get_task_ctx(waker)))
       near = this_cpu;
-    cpu = claim_idle_near(p, (u32)near, (u32)prev_cpu);
+    if (any_idle)
+      cpu = claim_idle_near(p, (u32)near, (u32)prev_cpu);
     is_idle = cpu >= 0;
     if (!is_idle)
       cpu = llc_frees_soon(p, (u32)near);
@@ -387,12 +405,27 @@ s32 BPF_STRUCT_OPS(elara_select_cpu, struct task_struct* p, s32 prev_cpu, u64 wa
   // Run directly on the idle cpu, unless tasks with an earlier deadline are
   // already queued there (their kick is still on the way): the local DSQ runs
   // before them. Otherwise enqueue() queues it properly.
+  //
+  // Not onto a cpu that runs a task of ours: for a sync wakeup the kernel's
+  // default returns the cpu of the waker as "idle" (the waker is expected to
+  // sleep right away) while the waker still runs there. Put into the local DSQ
+  // from here, a task that preempts the waker by key waited behind it without
+  // SCX_ENQ_PREEMPT and without a slice timer, until the waker slept or the
+  // tick ended its slice (kernels before 7.1 don't hand it back), while a less
+  // urgent task went to an idle cpu. enqueue() decides instead: it preempts
+  // (see SYNC_PREEMPT_MIN_NS) or places the task elsewhere.
+  if (is_idle)
+  {
+    struct dispatch_ctx* d = get_dispatch_ctx(cpu);
+    if (d && d->running_deadline != DEADLINE_NONE)
+      is_idle = false;
+  }
   if (is_idle && tctx)
   {
     u64 now = bpf_ktime_get_ns();
     u64 slack = wakeup_slack(p, tctx);
     s64 lag = task_lag(p, tctx, true);
-    if (cpu_load_ahead(cpu, slack, lag, !background_policy(p)) == 0)
+    if (cpu_load_ahead(cpu, slack, lag, !background_policy(p), now) == 0)
     {
       set_queue_keys(tctx, cpu, now, slack, lag);
       note_local_bound((u32)cpu, p);
@@ -458,8 +491,11 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
     return;
   }
 
-  if (enq_flags & SCX_ENQ_WAKEUP)
+  // Not again for a wakeup select_cpu() already looked at. The kernel doesn't
+  // ask select_cpu() for a task bound to one cpu: its boost is decided here.
+  if ((enq_flags & SCX_ENQ_WAKEUP) && !tctx->boost_checked)
     apply_wake_boost(p, tctx);
+  tctx->boost_checked = false;
 
   // An RT or deadline task preempted it while it ran (enq_immed). It keeps its
   // key, deadline and the rest of its slice. An idle cpu runs it right away.
@@ -552,12 +588,26 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
   // A re-enqueue (the cpu was taken by an RT task) keeps the deadline: the task
   // has already waited for it.
   bool reenq = enq_flags & SCX_ENQ_REENQ;
-  u64 deadline = reenq ? tctx->deadline : make_deadline(now, slack, lag);
+  u64 kept_deadline = tctx->deadline;
 
   // A woken task goes where it runs soonest, so does a re-enqueued one (it was
   // about to run, see enq_immed), a task that comes back after its slice is
-  // balanced by weight.
-  u32 target = (enq_flags & SCX_ENQ_WAKEUP) || reenq ? (u32)pick_enqueue_cpu(p, lag, slack, cpu, enq_flags & SCX_ENQ_WAKEUP) : (u32)pick_balance_cpu(p, slack, cpu);
+  // balanced by weight. Background work is placed as what it is below: woken,
+  // but it doesn't preempt (like select_cpu() does). Placed as if it would,
+  // its own busy cpu looked free (no work ahead) and it was queued there,
+  // behind the running task, without looking for an idle cpu.
+  bool may_preempt = (enq_flags & SCX_ENQ_WAKEUP) && !background_policy(p);
+  // A task that yielded stays on its cpu: it gave the cpu up to wait for
+  // something, often a task of the same cpu, not because there is too much
+  // work there. Balanced, every yield cost a weight scan of the llc
+  // (stress-ng --resched took twice as long).
+  bool yielded = tctx->yield_pending;
+  tctx->yield_pending = false;
+  u32 target = cpu;
+  if ((enq_flags & SCX_ENQ_WAKEUP) || reenq)
+    target = (u32)pick_enqueue_cpu(p, lag, slack, cpu, may_preempt);
+  else if (!yielded)
+    target = (u32)pick_balance_cpu(p, slack, cpu);
   if (!cpu_is_online(target))
     target = cpu;
   if (target != cpu)
@@ -568,7 +618,7 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
 
   set_queue_keys(tctx, target, now, slack, lag);
   if (reenq)
-    tctx->deadline = deadline;
+    tctx->deadline = kept_deadline;
 
   struct dispatch_ctx* dctx = get_dispatch_ctx(target);
   bool running_ours = dctx && dctx->running_deadline != DEADLINE_NONE;
@@ -579,7 +629,7 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
   // preempted right away. A kick (SCX_KICK_PREEMPT) only takes effect through
   // irq_work, which on the test VM cost a woken task ~1.5ms more than EEVDF.
   // Background work doesn't preempt (see background_policy()).
-  bool preempt = (enq_flags & SCX_ENQ_WAKEUP) && running_ours && key_before(tctx->key + PREEMPT_MARGIN_NS, dctx->running_key) && !background_policy(p);
+  bool preempt = may_preempt && running_ours && key_before(tctx->key + PREEMPT_MARGIN_NS, dctx->running_key);
   // The waker runs on @target (this cpu, called from its wakeup) and the
   // wakeup is a sync one (see SYNC_PREEMPT_MIN_NS).
   bool sync = tctx->sync_wake;
@@ -652,6 +702,7 @@ void BPF_STRUCT_OPS(elara_dispatch, s32 cpu, struct task_struct* prev)
 {
   u64 prev_key = DEADLINE_NONE;
   u64 prev_deadline = DEADLINE_NONE;
+  bool yielded = false;
   struct task_ctx* pctx = NULL;
   struct dispatch_ctx* dctx = get_dispatch_ctx(cpu);
   u64 now = bpf_ktime_get_ns();
@@ -673,8 +724,25 @@ void BPF_STRUCT_OPS(elara_dispatch, s32 cpu, struct task_struct* prev)
       // key and deadline: the task gets the rest of its slice back.
       u64 used = elapsed(now, pctx->started_at);
       pctx->burst += used;
-      // Its slice is used up (a preemption isn't that).
-      if (!dctx->preempt_pending)
+      // Its slice ended long before it was used up, and nothing preempted
+      // it: it called sched_yield() (without ops.yield the kernel just
+      // sets the slice to 0). Handled like a used-up slice, the yield did
+      // nothing while its key was still earlier than the head of the
+      // queue (its vtime barely moved): a thread spinning on
+      // sched_yield() kept half of a cpu that it shared with the thread
+      // it waited for (EEVDF: 2%). Wine's SwitchToThread() is such a
+      // yield. The kicks that end a slice on time come at its end (see
+      // slice_timer_fn()).
+      //
+      // Like SwitchToThread() on Windows, which the games were written
+      // for: the next task of the own cpu gets one turn, the yielding task
+      // is charged only the time it used and keeps its place for its real
+      // work after that. Unreal Engine's game and render threads yield
+      // thousands of times a second; charged the rest of the slice for each
+      // yield (EEVDF), they lost to every other task of their cpu after.
+      yielded = !dctx->preempt_pending && used + RESUME_SLICE_MIN_NS < pctx->granted_slice;
+      // Its slice is used up (a preemption or a yield isn't that).
+      if (!dctx->preempt_pending && !yielded)
         pctx->cpu_bound = true;
       charge_wake_boost(pctx, used);
       charge_vtime(prev, pctx, used);
@@ -696,7 +764,11 @@ void BPF_STRUCT_OPS(elara_dispatch, s32 cpu, struct task_struct* prev)
     }
   }
 
-  u32 res = dispatch_dsq_per_cpu(cpu, prev_key, prev_deadline);
+  u32 res = dispatch_dsq_per_cpu(cpu, dctx, now, prev_key, prev_deadline, yielded);
+  // It yielded and another task takes over: it comes back through enqueue()
+  // now, which leaves it on this cpu (see yield_pending there).
+  if (pctx)
+    pctx->yield_pending = yielded && res == DSP_TOOK;
   if (res == DSP_TOOK || !prev || !(prev->scx.flags & SCX_TASK_QUEUED))
     return;
 
@@ -733,6 +805,12 @@ void BPF_STRUCT_OPS(elara_dispatch, s32 cpu, struct task_struct* prev)
     s32 better = better_cpu_alone(prev, pctx, cpu, now);
     if (better >= 0)
     {
+      // Its key and deadline for the next slice, like below: with the old
+      // ones, from before the vtime of this slice was charged, running()
+      // took less than its slack over to the other cpu (for a task of low
+      // weight less than none: a key earlier than its vtime).
+      pctx->key = prev_key;
+      pctx->deadline = prev_deadline;
       pctx->upmigrate_cpu = (u32)better + 1;
       pctx->last_migrated_at = now;
       return;
@@ -778,7 +856,8 @@ void BPF_STRUCT_OPS(elara_running, struct task_struct* p)
   if (!dispatch_ctx)
     return;
   // A task started: the queue of this cpu moves (see cpu_stuck()).
-  dispatch_ctx->last_progress = bpf_ktime_get_ns();
+  u64 now = bpf_ktime_get_ns();
+  dispatch_ctx->last_progress = now;
 
   struct task_ctx* context = get_task_ctx(p);
   if (!context)
@@ -800,13 +879,16 @@ void BPF_STRUCT_OPS(elara_running, struct task_struct* p)
 
   dispatch_ctx->running_key = context->key;
   dispatch_ctx->running_deadline = context->deadline;
-  dispatch_ctx->running_since = bpf_ktime_get_ns();
+  dispatch_ctx->running_since = now;
   dispatch_ctx->running_slack = effective_slack(p, context);
   dispatch_ctx->running_cpu_bound = context->cpu_bound;
   dispatch_ctx->running_short = runs_short(context);
   dispatch_ctx->running_brief = !context->cpu_bound && context->run_avg < BRIEF_RUN_NS;
   dispatch_ctx->preempt_pending = false;
   context->immed = false;
+  // select_cpu() put it straight into the local DSQ, enqueue() didn't see it.
+  context->boost_checked = false;
+  context->yield_pending = false;
 
   // Out of the local DSQ (see note_local()).
   dispatch_ctx->local_weight = 0;
@@ -817,7 +899,7 @@ void BPF_STRUCT_OPS(elara_running, struct task_struct* p)
   if (p->scx.slice > SLICE_NS)
     scx_bpf_task_set_slice(p, SLICE_NS);
 
-  context->started_at = bpf_ktime_get_ns();
+  context->started_at = now;
   // A cpu dispatch claimed for it that it didn't go to (the kernel put it back
   // without enqueue(), see SCX_EV_ENQ_SKIP_EXITING) stays idle: kicked so it
   // counts as idle again.
@@ -892,10 +974,10 @@ void BPF_STRUCT_OPS(elara_quiescent, struct task_struct* p, u64 deq_flags)
 }
 
 // Every context switch: when the next task is an RT or deadline task, the cpu
-// is taken from us, from one of our tasks or from idle. If it keeps the cpu for
-// RT_EVACUATE_DELAY_NS, the tasks already picked for it (the preempted one goes
-// back to the front of them) are placed again. An idle cpu is woken right away
-// for the first task waiting in its queue.
+// is taken from us, from one of our tasks or from idle. If RT tasks keep the cpu
+// for RT_EVACUATE_DELAY_NS, the tasks already picked for it (the preempted one
+// goes back to the front of them) are placed again, and an idle cpu is woken
+// for the first task waiting in its queue (rt_timer_fn()).
 // (This replaces ops.cpu_release, which newer kernels deprecate.)
 SEC("tp_btf/sched_switch")
 int BPF_PROG(elara_sched_switch, bool preempt, struct task_struct* prev, struct task_struct* next, unsigned int prev_state)
@@ -907,27 +989,35 @@ int BPF_PROG(elara_sched_switch, bool preempt, struct task_struct* prev, struct 
   struct dispatch_ctx* dctx = get_dispatch_ctx(cpu);
 
   bool rt = is_rt_task(next);
-  if (dctx)
-    set_rt_busy(dctx, rt);
-  if (!rt)
+  // Only when the cpu changes over to RT tasks: a switch from one RT task to
+  // another started the timer again, and RT tasks taking turns (irq threads,
+  // audio) kept pushing it out.
+  if (!dctx || !set_rt_busy(dctx, rt) || !rt)
     return 0;
 
+  // Most RT tasks are done in a moment (see RT_EVACUATE_DELAY_NS): woken right
+  // away, an idle cpu came out of idle for every irq thread or audio period
+  // to take a task that would have run a few microseconds later. With
+  // PREEMPT_RT the timer runs in a low priority RT thread (BPF timers are
+  // soft hrtimers), which the RT task holding the cpu may keep from running:
+  // there the idle cpu is still woken right away.
+  if (CONFIG_PREEMPT_RT)
+    kick_idle_for_waiting(cpu);
   // With enq_immed the preempted task already came back through enqueue().
-  if (!enq_immed && dsq_queued(SCX_DSQ_LOCAL_ON | cpu))
+  bool local = !enq_immed && dsq_queued(SCX_DSQ_LOCAL_ON | cpu);
+  if (local || (!CONFIG_PREEMPT_RT && dsq_queued(cpu_dsq(cpu))))
   {
     u32 key = (cpu & (MAX_CPUS - 1)) + MAX_CPUS;
     struct elara_timer* st = bpf_map_lookup_elem(&slice_timers, &key);
     if (st)
       bpf_timer_start(&st->timer, RT_EVACUATE_DELAY_NS, BPF_F_TIMER_CPU_PIN);
   }
-  kick_idle_for_waiting(cpu);
   return 0;
 }
 
 SCX_OPS_DEFINE(elara_ops,
                .init = (void*)elara_init,
                .init_task = (void*)elara_init_task,
-               .exit_task = (void*)elara_exit_task,
                .select_cpu = (void*)elara_select_cpu,
                .quiescent = (void*)elara_quiescent,
                .running = (void*)elara_running,

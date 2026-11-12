@@ -236,6 +236,96 @@ static void test_missing_online()
   CHECK(!m.read().has_value());
 }
 
+// The read-only data of the BPF skeleton that setup_elara_topology() fills in,
+// with the names and sizes of source/datatypes.h (MAX_CPUS 512).
+struct FakeSkel
+{
+  struct
+  {
+    std::uint32_t nr_llcs;
+    std::uint32_t cpu_to_llc[512];
+    std::uint8_t cpu_online[512];
+    std::uint16_t cpu_capacity[512];
+    std::uint8_t cpu_fast[512];
+    std::uint16_t big_cpus[512];
+    std::uint16_t little_cpus[512];
+    std::uint32_t nr_big_cpus;
+    std::uint32_t nr_little_cpus;
+    bool hybrid;
+    bool smt;
+    std::int32_t cpu_sibling[512];
+    std::uint16_t llc_cpus[512];
+    std::uint16_t llc_start[512];
+    std::uint16_t llc_len[512];
+  } storage{};
+  decltype(storage)* rodata = &storage;
+};
+
+// The lists of the cpus of each llc (llc_cpus, llc_start, llc_len): the BPF
+// part scans an llc through them (claim_idle_in_llc(), pick_balance_cpu(),
+// pick_enqueue_cpu(), find_earliest()), so each must hold exactly the online
+// cpus of its llc. Two llcs whose cpus interleave (even and odd ids), one cpu
+// offline.
+static void test_llc_lists()
+{
+  Machine m("llc_lists");
+  m.online("0-4,6-7");
+  m.possible("0-7");
+  for (unsigned c = 0; c < 8; ++c)
+    if (c != 5)
+      m.cpu(c, 0, std::to_string(c), c % 2 ? "1,3,5,7" : "0,2,4,6");
+
+  FakeSkel skel;
+  CHECK(setup_elara_topology(&skel, m.cpu_root, m.devices_root, m.cpuinfo));
+  const auto& ro = *skel.rodata;
+  CHECK(ro.nr_llcs == 2);
+  if (ro.nr_llcs != 2)
+    return;
+
+  std::vector<int> seen(8, 0);
+  std::uint32_t total = 0;
+  for (std::uint32_t llc = 0; llc < ro.nr_llcs; ++llc)
+  {
+    total += ro.llc_len[llc];
+    for (std::uint32_t i = 0; i < ro.llc_len[llc]; ++i)
+    {
+      const std::uint32_t c = ro.llc_cpus[ro.llc_start[llc] + i];
+      CHECK(c < 8);
+      if (c >= 8)
+        continue;
+      ++seen[c];
+      CHECK(ro.cpu_online[c]);
+      CHECK(ro.cpu_to_llc[c] == llc);
+    }
+  }
+  // every online cpu exactly once, the offline one nowhere
+  CHECK(total == 7);
+  for (unsigned c = 0; c < 8; ++c)
+    CHECK(seen[c] == (c == 5 ? 0 : 1));
+  CHECK(ro.llc_len[ro.cpu_to_llc[0]] == 4);
+  CHECK(ro.llc_len[ro.cpu_to_llc[1]] == 3);
+}
+
+// Without "possible" the cpu ids come from "online" alone: the sibling of cpu 1,
+// cpu 3, is offline and has a higher id than any of them. It must not be
+// looked up beyond the known cpus, and cpu 1 has no sibling to use.
+static void test_sibling_beyond_ids()
+{
+  Machine m("sibling_beyond_ids");
+  m.online("0-2");
+  m.cpu(0, 0, "0,2", "0-2");
+  m.cpu(1, 0, "1,3", "0-2");
+  m.cpu(2, 0, "0,2", "0-2");
+
+  FakeSkel skel;
+  CHECK(setup_elara_topology(&skel, m.cpu_root, m.devices_root, m.cpuinfo));
+  const auto& ro = *skel.rodata;
+  CHECK(ro.smt);
+  CHECK(ro.cpu_sibling[0] == 2);
+  CHECK(ro.cpu_sibling[1] == -1);
+  CHECK(ro.cpu_sibling[2] == 0);
+}
+
 int main()
 {
   const std::vector<std::pair<const char*, std::function<void()>>> tests = {
@@ -246,6 +336,8 @@ int main()
       {"kernel_capacities", test_kernel_capacities},
       {"intel_core_types", test_intel_core_types},
       {"missing_online", test_missing_online},
+      {"llc_lists", test_llc_lists},
+      {"sibling_beyond_ids", test_sibling_beyond_ids},
   };
   for (const auto& [name, fn] : tests)
   {

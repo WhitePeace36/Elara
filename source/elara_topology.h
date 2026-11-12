@@ -409,8 +409,12 @@ bool setup_elara_topology(Skel* skel, const std::filesystem::path& cpu_root = "/
   for (std::uint32_t cpu = 0; cpu < topo->nr_cpu_ids; ++cpu)
   {
     skel->rodata->cpu_capacity[cpu] = static_cast<std::uint16_t>(cap_max ? topo->cpu_capacity[cpu] * 1024 / cap_max : 1024);
+    // The sibling comes from thread_siblings_list and can be a cpu id beyond
+    // the ones known here (from "possible", or without it from "online"): an
+    // offline sibling with the highest id. Not online then either.
     const std::int32_t sibling = topo->cpu_sibling[cpu];
-    skel->rodata->cpu_sibling[cpu] = sibling >= 0 && topo->cpu_online[sibling] ? sibling : -1;
+    const bool sibling_online = sibling >= 0 && static_cast<std::uint32_t>(sibling) < topo->nr_cpu_ids && topo->cpu_online[sibling];
+    skel->rodata->cpu_sibling[cpu] = sibling_online ? sibling : -1;
   }
 
   std::cerr << "elara: topology: " << topo->nr_cpu_ids << " cpu ids (" << nr_online << " online), " << topo->nr_llcs << " llc domain(s), smt "

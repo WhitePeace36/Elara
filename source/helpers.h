@@ -139,7 +139,12 @@ static __always_inline bool is_rt_task(const struct task_struct* p)
   // tasks: they can run for a long time (threaded NAPI, irq storms).
   if (policy == SCHED_FIFO && p->rt_priority == STOPPER_RT_PRIO && is_percpu_kthread(p))
     return false;
-  return policy == SCHED_FIFO || policy == SCHED_RR || policy == SCHED_DEADLINE;
+  // By priority, not by policy: a task of ours that holds a lock an RT task
+  // waits for (a PI futex, any lock with PREEMPT_RT) runs in the RT class for
+  // that time, with its policy unchanged. Its cpu is taken just the same, and
+  // by policy it looked free: wakeups were placed there and waited until the
+  // cpu counted as stuck. Deadline tasks have priority -1.
+  return p->prio < MAX_RT_PRIO_ELARA;
 }
 
 // The cpu runs a task of a higher sched class (RT, deadline) right now. sched_ext
@@ -153,15 +158,22 @@ static __always_inline bool cpu_taken_by_rt(u32 cpu)
 // A sched_switch on the cpu of @dctx: its next task is an RT or deadline task
 // (@rt) or not. nr_rt_busy counts the cpus in state RT_BUSY_YES, so it follows
 // every change of the state, and both change atomically: elara_init() sets the
-// state of other cpus at the same time (init_rt_busy()).
-static __always_inline void set_rt_busy(struct dispatch_ctx* dctx, bool rt)
+// state of other cpus at the same time (init_rt_busy()), sync_rt_busy() at any
+// time. True if the state changed.
+static __always_inline bool set_rt_busy(struct dispatch_ctx* dctx, bool rt)
 {
   u32 state = rt ? RT_BUSY_YES : RT_BUSY_NO;
+  // Most switches don't change it: no atomic exchange for those (this runs
+  // for every context switch of the system). RT_BUSY_UNKNOWN never equals
+  // @state, so the first switch after init always gets through.
+  if (dctx->rt_busy == state)
+    return false;
   u32 old = __sync_lock_test_and_set(&dctx->rt_busy, state);
   if (rt && old != RT_BUSY_YES)
     __sync_fetch_and_add(&nr_rt_busy, 1);
   else if (!rt && old == RT_BUSY_YES)
     __sync_fetch_and_sub(&nr_rt_busy, 1);
+  return old != state;
 }
 
 // elara_init() found the cpu of @dctx running an RT or deadline task (@rt) or
