@@ -703,6 +703,8 @@ void BPF_STRUCT_OPS(elara_dispatch, s32 cpu, struct task_struct* prev)
   u64 prev_key = DEADLINE_NONE;
   u64 prev_deadline = DEADLINE_NONE;
   bool yielded = false;
+  bool preempted = false;
+  u64 slice_left = 0;
   struct task_ctx* pctx = NULL;
   struct dispatch_ctx* dctx = get_dispatch_ctx(cpu);
   u64 now = bpf_ktime_get_ns();
@@ -740,17 +742,25 @@ void BPF_STRUCT_OPS(elara_dispatch, s32 cpu, struct task_struct* prev)
       // work after that. Unreal Engine's game and render threads yield
       // thousands of times a second; charged the rest of the slice for each
       // yield (EEVDF), they lost to every other task of their cpu after.
-      yielded = !dctx->preempt_pending && used + RESUME_SLICE_MIN_NS < pctx->granted_slice;
+      slice_left = pctx->granted_slice > used ? pctx->granted_slice - used : 0;
+      // A preemption (a kick, see enqueue()) counts only while the slice
+      // isn't used up: when the slice ended by itself just before the kick
+      // took effect, the task kept its key and deadline from before this
+      // slice and its boost, and went on with them for another slice.
+      preempted = dctx->preempt_pending && slice_left > RESUME_SLICE_MIN_NS;
+      if (dctx->preempt_pending && !preempted)
+        dctx->preempt_pending = false;
+      yielded = !dctx->preempt_pending && slice_left > RESUME_SLICE_MIN_NS;
       // Its slice is used up (a preemption or a yield isn't that).
-      if (!dctx->preempt_pending && !yielded)
+      if (!preempted && !yielded)
         pctx->cpu_bound = true;
       charge_wake_boost(pctx, used);
       charge_vtime(prev, pctx, used);
-      if (!dctx->preempt_pending && boost_spent(pctx))
+      if (!preempted && boost_spent(pctx))
         pctx->boost_slack = 0;
-      pctx->granted_slice = pctx->granted_slice > used ? pctx->granted_slice - used : 0;
+      pctx->granted_slice = slice_left;
       pctx->started_at = now;
-      if (dctx->preempt_pending)
+      if (preempted)
       {
         prev_key = pctx->key;
         prev_deadline = pctx->deadline;
@@ -839,9 +849,13 @@ void BPF_STRUCT_OPS(elara_dispatch, s32 cpu, struct task_struct* prev)
   dctx->running_short = runs_short(pctx);
   dctx->running_brief = false;
   dctx->last_progress = now;
-  scx_bpf_task_set_slice(prev, SLICE_NS);
-  pctx->granted_slice = SLICE_NS;
-  start_slice(cpu, dctx, now, SLICE_NS);
+  // Preempted but nothing earlier was there when dispatch looked: it goes on
+  // with the rest of its slice (like a preempted task that goes back to its
+  // queue, see resume_slice), not with a new one.
+  u64 slice = preempted ? slice_left : SLICE_NS;
+  scx_bpf_task_set_slice(prev, slice);
+  pctx->granted_slice = slice;
+  start_slice(cpu, dctx, now, slice);
   dctx->running_key = prev_key;
   dctx->running_deadline = prev_deadline;
   dctx->running_since = now;
