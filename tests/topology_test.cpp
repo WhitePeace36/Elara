@@ -257,6 +257,7 @@ struct FakeSkel
     std::uint16_t llc_cpus[512];
     std::uint16_t llc_start[512];
     std::uint16_t llc_len[512];
+    std::uint32_t nr_llc_cpus;
   } storage{};
   decltype(storage)* rodata = &storage;
 };
@@ -298,8 +299,12 @@ static void test_llc_lists()
       CHECK(ro.cpu_to_llc[c] == llc);
     }
   }
-  // every online cpu exactly once, the offline one nowhere
+  // every online cpu exactly once, the offline one nowhere; one llc after the
+  // other (find_earliest() goes through the other llcs as one range)
   CHECK(total == 7);
+  CHECK(ro.nr_llc_cpus == total);
+  for (std::uint32_t llc = 1; llc < ro.nr_llcs; ++llc)
+    CHECK(ro.llc_start[llc] == ro.llc_start[llc - 1] + ro.llc_len[llc - 1]);
   for (unsigned c = 0; c < 8; ++c)
     CHECK(seen[c] == (c == 5 ? 0 : 1));
   CHECK(ro.llc_len[ro.cpu_to_llc[0]] == 4);

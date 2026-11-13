@@ -39,6 +39,8 @@ const volatile s32 cpu_sibling[MAX_CPUS] = {};
 const volatile u16 llc_cpus[MAX_CPUS] = {};
 const volatile u16 llc_start[MAX_CPUS] = {};
 const volatile u16 llc_len[MAX_CPUS] = {};
+// the entries of llc_cpus: all online cpus, one llc after the other
+const volatile u32 nr_llc_cpus = 0;
 
 struct task_ctx
 {

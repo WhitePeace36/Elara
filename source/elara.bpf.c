@@ -517,6 +517,8 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
     }
     queue_on(cpu, now);
     scx_bpf_dsq_insert_vtime(p, cpu_dsq(cpu), slice, tctx->key, enq_flags);
+    // For the task waiting at the head of the queue (this one isn't in it
+    // before enqueue() returns).
     kick_idle_for_waiting(cpu);
     return;
   }
