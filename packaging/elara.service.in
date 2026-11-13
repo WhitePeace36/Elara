@@ -2,10 +2,14 @@
 Description=elara adaptive Linux scheduler (sched_ext)
 After=multi-user.target
 ConditionPathExists=/sys/kernel/sched_ext
-# Only one sched_ext scheduler can be loaded at a time: starting elara stops
-# the services of the scx schedulers (and starting one of them stops elara),
-# and elara starts only once they are stopped.
-Conflicts=scx.service scx_loader.service
+# Only one sched_ext scheduler can be loaded at a time. No Conflicts= with the
+# services of the scx schedulers (scx.service, scx_loader.service): systemd
+# then stops elara whenever one of them starts, and scx_loader.service is
+# started over D-Bus by anything that asks it something (scxctl, the CachyOS
+# Kernel Manager), also when it is disabled, without loading a scheduler.
+# elara stayed stopped after that (a stop by systemd is no failure to restart
+# after). A scheduler one of them tries to load while elara runs fails to
+# load; stop elara first. Started at boot, elara comes after them.
 After=scx.service scx_loader.service
 # A scheduler loaded another way (started by hand) keeps elara from loading:
 # it tries again every 5s, up to 30 times in 5 minutes.

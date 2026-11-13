@@ -5,11 +5,11 @@
 #                        otherwise), leave enabled or not as it is
 #   elara-hook remove    stop and disable elara.service
 #
-# Only one sched_ext scheduler can be loaded at a time. The services of the
-# scx schedulers (scx.service, scx_loader.service) conflict with
-# elara.service (see there): starting one stops the other. Enabled at boot
-# next to elara, the two would race at every boot, so they are disabled on
-# install and enabled again on remove (only those this script disabled).
+# Only one sched_ext scheduler can be loaded at a time. Enabled at boot next
+# to elara, scx.service or scx_loader.service (which loads its default
+# scheduler when it starts at boot) would get there first and keep elara from
+# loading, so they are disabled on install and enabled again on remove (only
+# those this script disabled). Running ones are stopped on install.
 
 STATE_DIR=/var/lib/elara
 STATE=$STATE_DIR/disabled-units
@@ -40,7 +40,9 @@ install)
         echo "elara: disabled$disabled (only one sched_ext scheduler can run), enabled again when elara is removed"
     fi
     if live; then
-        # Stops the other schedulers' services if running (Conflicts=).
+        # Whatever scheduler they run is in the way (elara.service has no
+        # Conflicts= with them, see there).
+        systemctl stop $OTHERS >/dev/null 2>&1 || true
         systemctl enable --now elara.service || echo "elara: could not start elara.service, see: journalctl -u elara.service"
     else
         systemctl enable elara.service >/dev/null 2>&1 || true

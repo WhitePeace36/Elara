@@ -113,10 +113,15 @@ Installing the package enables `elara.service` and starts it right away (and at 
 boot). An update of the package restarts a running elara and leaves the service enabled
 or disabled as it was.
 
-Only one sched_ext scheduler can be loaded at a time. `elara.service` conflicts with the
-services of the scx schedulers (`scx.service`, `scx_loader.service`): starting one stops
-the other. If one of them is enabled at boot, installing elara disables it (both would
-race at every boot otherwise), and removing elara enables it again. A scheduler started
+Only one sched_ext scheduler can be loaded at a time. `elara.service` doesn't stop the
+services of the scx schedulers (`scx.service`, `scx_loader.service`) and isn't stopped
+by them: `scx_loader.service` is started over D-Bus by anything that asks it something
+(`scxctl`, the CachyOS Kernel Manager), and as a conflict every such start stopped
+elara. While elara runs, a scheduler they try to load fails to load: stop elara first
+(`systemctl stop elara.service`); to go back, stop that scheduler (`scxctl stop` or
+`systemctl stop scx.service`) and start elara. Installing elara stops both services,
+and if one of them is enabled at boot it disables it (it would get there first at every
+boot otherwise); removing elara enables it again. A scheduler started
 another way (by hand) keeps elara from loading: the service then tries again every 5
 seconds, up to 30 times (about 2.5 minutes), and `journalctl -u elara.service` names the
 scheduler in the way. After that it stays stopped until `systemctl start elara.service`
