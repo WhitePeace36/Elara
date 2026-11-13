@@ -338,7 +338,11 @@ weight. Counting tasks instead of weight would leave two nice -20 tasks sharing 
 while a nice 0 task has another core to itself. The task that runs next on the own
 core is already in its local queue at that point, which elara can't look into: its
 weight is remembered when dispatch picks it (counting it as nice 0 kept a light task
-next to a heavy one while another core had only light tasks).
+next to a heavy one while another core had only light tasks). The weight of each
+core's queue is kept as a running total (added when a task is queued, taken off in
+`ops.dequeue` when it leaves the queue), so balancing doesn't go through the queues;
+kernels that don't call `ops.dequeue` for tasks leaving a queue (before
+`SCX_TASK_IN_CUSTODY`) sum up the first 16 tasks of the queue instead.
 
 It isn't balanced at all when the task that runs next on its core only runs for a
 moment (its last run ended in sleep: a woken task, a kworker): then it waits for its

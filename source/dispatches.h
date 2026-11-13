@@ -392,6 +392,10 @@ static __always_inline u64 cpu_weight_load(u32 cpu, struct task_struct* self, u6
     load += lw ? lw + (nlocal - 1) * NICE_0_WEIGHT : nlocal * NICE_0_WEIGHT;
   }
 
+  // @self isn't in a queue while it is placed: the total is the queue's.
+  if (track_queued_weight())
+    return load + queued_weight_of(dctx, cpu);
+
   u64 dsq = cpu_dsq(cpu);
   bpf_for_each(scx_dsq, q, dsq, 0)
   {
@@ -882,21 +886,27 @@ static __always_inline u64 earliest_deadline(void)
 }
 
 // Rough weight of the tasks on @cpu other than @self: the running one and the
-// queued ones as nice 0 (cpu_weight_load() sums them up exactly, too costly for
-// all cpus of two llcs). A cpu taken by an RT task or stuck counts as
+// queued ones (as nice 0 where the queue's weight isn't counted, see
+// track_queued_weight(): going through the queues of all cpus of two llcs costs
+// too much). A cpu taken by an RT task or stuck counts as
 // RT_CPU_WEIGHT.
 static __always_inline u64 cpu_rough_load(u32 cpu, struct task_struct* self, u64 now)
 {
   u64 load = 0;
+  struct dispatch_ctx* dctx = get_dispatch_ctx(cpu);
   struct task_struct* curr = __COMPAT_scx_bpf_cpu_curr(cpu);
   if (curr && curr->pid)
   {
     if (curr != self)
       load += is_rt_task(curr) ? RT_CPU_WEIGHT : task_weight(curr);
   }
-  else if (cpu_stuck(cpu, now))
+  else if (cpu_stuck_ctx(dctx, cpu, now))
     load += RT_CPU_WEIGHT;
-  u64 queued = dsq_queued(cpu_dsq(cpu)) + dsq_queued(SCX_DSQ_LOCAL_ON | cpu);
+  // The queue's weight exactly where it is counted (see track_queued_weight()).
+  u64 nlocal = dsq_queued(SCX_DSQ_LOCAL_ON | cpu);
+  if (track_queued_weight())
+    return load + queued_weight_of(dctx, cpu) + nlocal * NICE_0_WEIGHT;
+  u64 queued = dsq_queued(cpu_dsq(cpu)) + nlocal;
   return load + queued * NICE_0_WEIGHT;
 }
 

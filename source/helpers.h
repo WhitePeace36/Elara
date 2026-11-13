@@ -115,6 +115,56 @@ static __always_inline struct dispatch_ctx* get_dispatch_ctx(u32 cpu)
   return bpf_map_lookup_percpu_elem(&dispatch_state, &key, cpu);
 }
 
+// The weight of the tasks in a cpu's queue is kept as a running total
+// (dispatch_ctx.queued_weight) where the kernel calls ops.dequeue whenever a task
+// leaves our custody, also when it is moved from our queue to a local DSQ to
+// run (SCX_TASK_IN_CUSTODY, 7.x). Older kernels call it only for tasks the BPF
+// part holds itself, never for ours (they are all in DSQs): there the balancing
+// goes through the queue (cpu_weight_load()).
+static __always_inline bool track_queued_weight(void)
+{
+  return bpf_core_enum_value_exists(enum scx_ent_flags, SCX_TASK_IN_CUSTODY);
+}
+
+// @tctx left the queue it was counted in (ops.dequeue, or it started).
+static __always_inline void note_unqueued(struct task_ctx* tctx)
+{
+  s32 c = tctx->queued_cpu;
+  if (c < 0)
+    return;
+  tctx->queued_cpu = -1;
+  struct dispatch_ctx* dctx = get_dispatch_ctx((u32)c);
+  if (dctx)
+    __sync_fetch_and_sub(&dctx->queued_weight, (s64)tctx->queued_w);
+}
+
+// @p goes into the queue of @cpu: count its weight there until it leaves it.
+// Before the insert: ops.dequeue for it can come right after that, from another
+// cpu.
+static __always_inline void note_queued(struct task_struct* p, struct task_ctx* tctx, u32 cpu)
+{
+  if (!track_queued_weight())
+    return;
+  note_unqueued(tctx);
+  struct dispatch_ctx* dctx = get_dispatch_ctx(cpu);
+  if (!dctx)
+    return;
+  u32 w = (u32)task_weight(p);
+  tctx->queued_cpu = (s32)cpu;
+  tctx->queued_w = w;
+  __sync_fetch_and_add(&dctx->queued_weight, (s64)w);
+}
+
+// Weight of the tasks in the queue of @cpu (cpu_dsq()) as counted (see
+// note_queued()), with @dctx its dispatch_ctx.
+static __always_inline u64 queued_weight_of(const struct dispatch_ctx* dctx, u32 cpu)
+{
+  if (!dctx || !dsq_queued(cpu_dsq(cpu)))
+    return 0;
+  s64 w = READ_ONCE(dctx->queued_weight);
+  return w > 0 ? (u64)w : 0;
+}
+
 static __always_inline u32 cpu_llc_id(u32 cpu)
 {
   cpu &= (MAX_CPUS - 1);

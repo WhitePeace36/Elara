@@ -172,6 +172,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(elara_init)
     dispatch_ctx->slice_end = 0;
     dispatch_ctx->timer_end = 0;
     dispatch_ctx->local_weight = 0;
+    dispatch_ctx->queued_weight = 0;
     dispatch_ctx->preempt_pending = false;
     dispatch_ctx->rt_busy = RT_BUSY_UNKNOWN;
 
@@ -249,6 +250,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(elara_init_task, struct task_struct* p, struct scx_
   tctx->last_migrated_at = 0;
   tctx->upmigrate_cpu = 0;
   tctx->cpu_bound = false;
+  tctx->queued_cpu = -1;
+  tctx->queued_w = 0;
   tctx->shared_since = 0;
   tctx->shared_seen = 0;
   tctx->turns_since = 0;
@@ -516,6 +519,7 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
       return;
     }
     queue_on(cpu, now);
+    note_queued(p, tctx, cpu);
     scx_bpf_dsq_insert_vtime(p, cpu_dsq(cpu), slice, tctx->key, enq_flags);
     // For the task waiting at the head of the queue (this one isn't in it
     // before enqueue() returns).
@@ -556,6 +560,7 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
       return;
     }
     queue_on(cpu, now);
+    note_queued(p, tctx, cpu);
     scx_bpf_dsq_insert_vtime(p, cpu_dsq(cpu), SLICE_NS, tctx->key, enq_flags);
     if (!ours)
       return;
@@ -581,6 +586,7 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
     u64 slice = tctx->resume_slice;
     tctx->resume_slice = 0;
     queue_on(cpu, now);
+    note_queued(p, tctx, cpu);
     scx_bpf_dsq_insert_vtime(p, cpu_dsq(cpu), slice, tctx->key, enq_flags);
     return;
   }
@@ -658,6 +664,7 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
   }
 
   queue_on(target, now);
+  note_queued(p, tctx, target);
   scx_bpf_dsq_insert_vtime(p, cpu_dsq(target), SLICE_NS, tctx->key, enq_flags);
 
   if (behind)
@@ -878,6 +885,12 @@ void BPF_STRUCT_OPS(elara_running, struct task_struct* p)
   struct task_ctx* context = get_task_ctx(p);
   if (!context)
     return;
+  // ops.dequeue took it out of the queue's weight when it left the queue.
+  if (context->queued_cpu >= 0)
+  {
+    note_unqueued(context);
+    __sync_fetch_and_add(&nr_unqueued_late, 1);
+  }
 
   // A task taken over from another cpu brings its lag along, its key moves to
   // the vtime of this cpu.
@@ -989,6 +1002,15 @@ void BPF_STRUCT_OPS(elara_quiescent, struct task_struct* p, u64 deq_flags)
   tctx->boost_slack = 0;
 }
 
+// @p leaves our custody (see track_queued_weight()): moved from a queue to a
+// local DSQ to run, or taken off the runqueue (a change of its properties).
+void BPF_STRUCT_OPS(elara_dequeue, struct task_struct* p, u64 deq_flags)
+{
+  struct task_ctx* tctx = get_task_ctx(p);
+  if (tctx)
+    note_unqueued(tctx);
+}
+
 // Every context switch: when the next task is an RT or deadline task, the cpu
 // is taken from us, from one of our tasks or from idle. If RT tasks keep the cpu
 // for RT_EVACUATE_DELAY_NS, the tasks already picked for it (the preempted one
@@ -1038,6 +1060,7 @@ SCX_OPS_DEFINE(elara_ops,
                .quiescent = (void*)elara_quiescent,
                .running = (void*)elara_running,
                .enqueue = (void*)elara_enqueue,
+               .dequeue = (void*)elara_dequeue,
                .dispatch = (void*)elara_dispatch,
                .stopping = (void*)elara_stopping,
                .exit = (void*)elara_exit,

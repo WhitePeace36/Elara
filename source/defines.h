@@ -173,8 +173,9 @@
 // A task that comes back after its slice is balanced by weight: it moves to the
 // cpu with the least weight of other tasks (running and queued), if that is
 // lighter than its own cpu by more than half its own weight. A cpu taken by an
-// RT or deadline task counts as RT_CPU_WEIGHT. Of a queue, at most
-// WEIGHT_SCAN_DEPTH tasks are summed up, the rest count as nice 0.
+// RT or deadline task counts as RT_CPU_WEIGHT. The weight of a queue is kept as
+// a running total (see track_queued_weight()); on kernels without that, at
+// most WEIGHT_SCAN_DEPTH tasks of it are summed up, the rest count as nice 0.
 #define RT_CPU_WEIGHT (1ULL << 32)
 #define WEIGHT_SCAN_DEPTH 16
 #define BALANCE_SAMPLES 2

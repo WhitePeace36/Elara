@@ -97,6 +97,10 @@ struct task_ctx
   // it called sched_yield() and another task took over its cpu, until it is
   // queued again (enqueue()) or starts (running())
   bool yield_pending;
+  // the cpu whose queued_weight counts it while it is in that cpu's queue, and
+  // the weight it counts with (see note_queued()); -1: none
+  s32 queued_cpu;
+  u32 queued_w;
   // woken and put into a local DSQ to run right away (to preempt, or onto an
   // idle cpu), until it starts (see reenq_immed())
   bool immed;
@@ -104,6 +108,11 @@ struct task_ctx
 
 struct dispatch_ctx
 {
+  // weight of the tasks in the queue of this cpu (cpu_dsq()), kept up to date
+  // on insert and ops.dequeue (see note_queued()). Changed by other cpus too,
+  // atomically. Can be off for a moment (a task counted just before it is
+  // inserted), so readers clamp it.
+  s64 queued_weight;
   // deadline and key of the task running on this cpu (DEADLINE_NONE: none of ours)
   u64 running_deadline;
   u64 running_key;
@@ -158,6 +167,9 @@ u64 nr_rt_busy;
 // STUCK_CHECK_INTERVAL_NS by whichever cpu gets to it first.
 u64 stuck_scan_at;
 u32 nr_stuck_cpus;
+// tasks that started while still counted in a queue's weight (see
+// note_queued()): 0 unless ops.dequeue was missed somewhere
+u64 nr_unqueued_late;
 u8 stuck_cpu[MAX_CPUS];
 
 // Per llc, updated with the scan for stuck cpus (see llc_scan()): the rough
