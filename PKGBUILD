@@ -9,7 +9,18 @@ pkgname=elara
 # 0.r<commits>.g<commit> of this checkout, like the .deb and .rpm (see
 # CMakeLists.txt). Worked out here instead of in pkgver(): makepkg writes what
 # pkgver() returns back into this file, which would change it after every commit.
-pkgver=0.r$(git -C "$startdir" rev-list --count HEAD 2>/dev/null || echo 0).g$(git -C "$startdir" rev-parse --short=7 HEAD 2>/dev/null || echo 0)
+# same scheme as CMakeLists.txt: X.Y.Z on the release tag vX.Y.Z,
+# X.Y.Z.rN.g<commit> N commits after it, 0.r<commits>.g<commit> without a tag
+_describe=$(git -C "$startdir" describe --tags --long --match 'v[0-9]*' 2>/dev/null || true)
+if [[ $_describe =~ ^v([0-9.]+)-([0-9]+)-g([0-9a-f]+)$ ]]; then
+  if [[ ${BASH_REMATCH[2]} == 0 ]]; then
+    pkgver=${BASH_REMATCH[1]}
+  else
+    pkgver=${BASH_REMATCH[1]}.r${BASH_REMATCH[2]}.g$(git -C "$startdir" rev-parse --short=7 HEAD)
+  fi
+else
+  pkgver=0.r$(git -C "$startdir" rev-list --count HEAD 2>/dev/null || echo 0).g$(git -C "$startdir" rev-parse --short=7 HEAD 2>/dev/null || echo 0)
+fi
 pkgrel=1
 pkgdesc='sched_ext CPU scheduler, tuned by nice values, for stable frame times'
 arch=('x86_64' 'aarch64')

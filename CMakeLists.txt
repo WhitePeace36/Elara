@@ -11,7 +11,7 @@ if(NOT DEFINED CMAKE_CXX_COMPILER AND NOT DEFINED ENV{CXX})
   set(CMAKE_CXX_COMPILER clang++)
 endif()
 
-project(elara LANGUAGES C CXX)
+project(elara VERSION 1.0.0 LANGUAGES C CXX)
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
@@ -24,18 +24,29 @@ if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
 endif()
 include(GNUInstallDirs)
 
-# Version of the packages: 0.r<commits>.g<commit>, like the PKGBUILD's pkgver
-# (increases with every commit, sorts correctly for pacman, dpkg and rpm).
-set(ELARA_VERSION 0)
+# Version of the packages, from git (sorts correctly for pacman, dpkg, rpm):
+#   on a release tag vX.Y.Z      X.Y.Z (= the VERSION in project() above)
+#   N commits after that tag     X.Y.Z.rN.g<commit>
+#   no release tag in the clone  0.r<commits>.g<commit>
+set(ELARA_VERSION ${PROJECT_VERSION})
 find_package(Git QUIET)
 if(GIT_FOUND AND EXISTS ${CMAKE_SOURCE_DIR}/.git)
+  execute_process(COMMAND ${GIT_EXECUTABLE} describe --tags --long --match "v[0-9]*"
+                  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+                  OUTPUT_VARIABLE ELARA_GIT_DESCRIBE OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
   execute_process(COMMAND ${GIT_EXECUTABLE} rev-list --count HEAD
                   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
                   OUTPUT_VARIABLE ELARA_GIT_COUNT OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
   execute_process(COMMAND ${GIT_EXECUTABLE} rev-parse --short=7 HEAD
                   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
                   OUTPUT_VARIABLE ELARA_GIT_HASH OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
-  if(ELARA_GIT_COUNT AND ELARA_GIT_HASH)
+  if(ELARA_GIT_DESCRIBE MATCHES "^v([0-9.]+)-([0-9]+)-g[0-9a-f]+$")
+    if(CMAKE_MATCH_2 EQUAL 0)
+      set(ELARA_VERSION ${CMAKE_MATCH_1})
+    else()
+      set(ELARA_VERSION ${CMAKE_MATCH_1}.r${CMAKE_MATCH_2}.g${ELARA_GIT_HASH})
+    endif()
+  elseif(ELARA_GIT_COUNT AND ELARA_GIT_HASH)
     set(ELARA_VERSION 0.r${ELARA_GIT_COUNT}.g${ELARA_GIT_HASH})
   endif()
   # A shallow clone (git clone --depth) doesn't have all commits: the count is
