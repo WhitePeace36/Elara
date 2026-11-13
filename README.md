@@ -110,8 +110,11 @@ sudo apt install ./elara_*.deb      # Debian / Ubuntu
 ```
 
 Installing the package enables `elara.service` and starts it right away (and at every
-boot). An update of the package restarts a running elara and leaves the service enabled
-or disabled as it was.
+boot). An update or reinstall of the package restarts elara, or starts it if it doesn't
+run, and leaves the service enabled at boot or not as it was. An
+`/etc/systemd/system/elara.service` (from the old `install.sh`, or copied there by hand)
+would override the unit of the package: installing or updating removes it. Drop-ins
+made with `systemctl edit elara.service` stay.
 
 Only one sched_ext scheduler can be loaded at a time. `elara.service` doesn't stop the
 services of the scx schedulers (`scx.service`, `scx_loader.service`) and isn't stopped
@@ -140,13 +143,11 @@ sudo systemctl stop elara.service      # back to the kernel's scheduler
 sudo systemctl start elara.service     # elara again
 ```
 
-Installed with the old `install.sh` before: remove those files first, otherwise the old
-unit in `/etc` takes precedence and keeps starting the old binary:
+Installed with the old `install.sh` before: the package removes the old unit in `/etc`
+by itself (see above). The old binary stays and isn't used any more:
 
 ```
-sudo systemctl disable --now elara.service
-sudo rm /etc/systemd/system/elara.service /usr/local/bin/elara
-sudo systemctl daemon-reload
+sudo rm /usr/local/bin/elara
 ```
 
 ## Uninstalling
