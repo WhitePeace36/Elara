@@ -631,6 +631,25 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
   struct dispatch_ctx* dctx = get_dispatch_ctx(target);
   bool running_ours = dctx && dctx->running_deadline != DEADLINE_NONE;
 
+  // A per-cpu kernel thread (kworker/N, ksoftirqd/N, ...) can only run on this
+  // cpu and is done in a moment: it goes first, whatever the keys say (see
+  // task_slack()). By key alone it lost to a task that stayed runnable and
+  // was behind: a woken task brings at most LAG_EARLY_MAX_NS of lag, a
+  // runnable one up to LAG_LATE_MAX_NS. With stress-ng --cpu 0 next to a game,
+  // kworker/N:1H (nice -20) waited 14ms while stress-ng ran on, kworker/N:1
+  // 82ms. Not one that used up its last slice: a kernel thread with real
+  // work (ksoftirqd under an interrupt flood) is scheduled by key like the
+  // rest. Not in front of another task already on its way to preempt.
+  if (may_preempt && running_ours && target == cpu && !dctx->preempt_key && is_percpu_kthread(p) && !tctx->cpu_bound)
+  {
+    dctx->preempt_pending = true;
+    dctx->preempt_key = tctx->key;
+    note_local_bound(target, p);
+    tctx->immed = true;
+    scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | target, SLICE_NS, enq_flags | SCX_ENQ_PREEMPT);
+    return;
+  }
+
   // Keys of the same cpu compare: a woken task preempts the running task when
   // it is clearly earlier. If it is also the earliest of the queue, it goes
   // straight to the local DSQ with SCX_ENQ_PREEMPT: the running task is
@@ -783,7 +802,8 @@ void BPF_STRUCT_OPS(elara_dispatch, s32 cpu, struct task_struct* prev)
     }
   }
 
-  u32 res = dispatch_dsq_per_cpu(cpu, dctx, now, prev_key, prev_deadline, yielded);
+  bool prev_kthread = prev && is_percpu_kthread(prev);
+  u32 res = dispatch_dsq_per_cpu(cpu, dctx, now, prev_key, prev_deadline, yielded, prev_kthread);
   // It yielded and another task takes over: it comes back through enqueue()
   // now, which leaves it on this cpu (see yield_pending there).
   if (pctx)

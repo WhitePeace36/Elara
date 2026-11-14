@@ -1105,7 +1105,8 @@ static __always_inline bool take_overdue(struct dispatch_ctx* dctx, u64 dsq, u64
 #define DSP_TOOK 0
 #define DSP_PREV 1
 #define DSP_NONE 2
-static __always_inline u32 dispatch_dsq_per_cpu(u32 cpu, struct dispatch_ctx* dctx, u64 now, u64 prev_key, u64 prev_deadline, bool yielded)
+static __always_inline u32 dispatch_dsq_per_cpu(u32 cpu, struct dispatch_ctx* dctx, u64 now, u64 prev_key, u64 prev_deadline, bool yielded,
+                                                 bool prev_kthread)
 {
   u64 own_dsq = cpu_dsq(cpu);
   u64 deadline;
@@ -1149,6 +1150,20 @@ static __always_inline u32 dispatch_dsq_per_cpu(u32 cpu, struct dispatch_ctx* dc
 
   if (take_overdue(dctx, own_dsq, now))
     return DSP_TOOK;
+
+  // A per-cpu kernel thread at the head of the queue goes before prev, whatever
+  // the keys say (see enqueue()): it can only run here and is done in a moment.
+  // Also for one that was queued without preempting (prev wasn't a task of ours
+  // then, or another task was already on its way).
+  if (dctx && prev_key != DEADLINE_NONE && !prev_kthread && head && hctx && is_percpu_kthread(head) && !hctx->cpu_bound)
+  {
+    if (scx_bpf_dsq_move_to_local(own_dsq, 0))
+    {
+      dctx->local_weight = head_weight;
+      dctx->local_cpu_bound = head_cpu_bound;
+      return DSP_TOOK;
+    }
+  }
 
   if (prev_key != DEADLINE_NONE && (own_key == DEADLINE_NONE || (!yielded && !key_before(own_key, prev_key))))
     return DSP_PREV;
