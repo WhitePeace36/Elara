@@ -141,6 +141,13 @@ struct dispatch_ctx
   // the running one, until it starts (0: none)
   u64 preempt_key;
   bool preempt_pending;
+  // the running task is a per-cpu kernel thread: another one doesn't preempt it
+  // ahead of its key (see enqueue())
+  bool running_kthread;
+  // a per-cpu kernel thread may wait in the queue of this cpu (set when one is
+  // queued, cleared by take_kthread() when it finds none). A hint: a missed
+  // update only means the thread waits by key.
+  bool kthread_queued;
   // this cpu runs an RT or deadline task: RT_BUSY_NO, RT_BUSY_YES (as seen by
   // the last sched_switch) or RT_BUSY_UNKNOWN (see set_rt_busy())
   u32 rt_busy;

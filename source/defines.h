@@ -74,6 +74,21 @@
 // weight (a task with a low weight uses up much more vtime per slice).
 #define LAG_EARLY_MAX_NS SLICE_NS
 #define LAG_LATE_MAX_NS (20ULL * NS_PER_MS)
+
+// A woken per-cpu kernel thread goes before the running task (and dispatch
+// takes one from its queue before prev) while its key is less than this past
+// the key of that task. A woken task is at most LAG_EARLY_MAX_NS ahead, a
+// runnable one up to LAG_LATE_MAX_NS behind (at nice 0): by key alone a kworker
+// lost to a cpu hog that was behind (14-82ms waits next to stress-ng). The
+// bound is in vtime, so it holds whether the thread sleeps in between or not: a
+// kernel thread that keeps doing work (ksoftirqd under an interrupt flood, a
+// kworker woken for every IO completion) uses up this lead and is scheduled by
+// key like the rest, with its weight. Without it every wakeup preempted, and
+// the share of such a thread had no bound.
+#define KTHREAD_AHEAD_NS LAG_LATE_MAX_NS
+// Tasks of the own queue dispatch looks at for a waiting per-cpu kernel thread
+// (see take_kthread()).
+#define KTHREAD_SCAN_DEPTH 8
 #define VTIME_BASE (1ULL << 40)
 #define VTIME_CPU_NONE ((u32)-1)
 

@@ -1076,6 +1076,48 @@ static __always_inline bool take_overdue(struct dispatch_ctx* dctx, u64 dsq, u64
   return false;
 }
 
+// Move the first per-cpu kernel thread of the own queue @dsq (within
+// KTHREAD_SCAN_DEPTH tasks) whose key is less than KTHREAD_AHEAD_NS past @ref
+// into the local DSQ. Only while one may be queued (kthread_queued): mostly
+// none is, and then this costs nothing.
+static __always_inline bool take_kthread(struct dispatch_ctx* dctx, u64 dsq, u64 ref)
+{
+  if (!dctx->kthread_queued)
+    return false;
+
+  struct task_struct* p;
+  u32 looked = 0;
+  bool maybe_more = false;
+  bpf_for_each(scx_dsq, p, dsq, 0)
+  {
+    if (++looked > KTHREAD_SCAN_DEPTH)
+    {
+      maybe_more = true;
+      break;
+    }
+    if (!is_percpu_kthread(p))
+      continue;
+    // The queue is ordered by key: none further back is within the bound
+    // either. This one still waits, so the hint stays.
+    if (!key_before(p->scx.dsq_vtime, ref + KTHREAD_AHEAD_NS))
+    {
+      maybe_more = true;
+      break;
+    }
+    if (!scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, SCX_DSQ_LOCAL, 0))
+    {
+      maybe_more = true;
+      continue;
+    }
+    note_local(bpf_get_smp_processor_id(), p);
+    // Others may wait too: the next dispatch looks again.
+    return true;
+  }
+  if (!maybe_more)
+    dctx->kthread_queued = false;
+  return false;
+}
+
 // Pick the next task for @cpu. @prev_key and @prev_deadline are what prev would
 // run with for another slice (DEADLINE_NONE: no prev that could continue).
 // Returns true when prev keeps running.
@@ -1151,19 +1193,15 @@ static __always_inline u32 dispatch_dsq_per_cpu(u32 cpu, struct dispatch_ctx* dc
   if (take_overdue(dctx, own_dsq, now))
     return DSP_TOOK;
 
-  // A per-cpu kernel thread at the head of the queue goes before prev, whatever
-  // the keys say (see enqueue()): it can only run here and is done in a moment.
-  // Also for one that was queued without preempting (prev wasn't a task of ours
-  // then, or another task was already on its way).
-  if (dctx && prev_key != DEADLINE_NONE && !prev_kthread && head && hctx && is_percpu_kthread(head) && !hctx->cpu_bound)
-  {
-    if (scx_bpf_dsq_move_to_local(own_dsq, 0))
-    {
-      dctx->local_weight = head_weight;
-      dctx->local_cpu_bound = head_cpu_bound;
-      return DSP_TOOK;
-    }
-  }
+  // A per-cpu kernel thread of the own queue goes before prev, or before the
+  // head of the queue when prev doesn't go on, within KTHREAD_AHEAD_NS of its
+  // key (see enqueue()): it can only run here and is done in a moment. For one
+  // that was queued without preempting: prev wasn't a task of ours then (an RT
+  // task, an idle cpu), another task was already on its way, or it waits
+  // behind tasks of earlier keys. Not in front of another per-cpu kernel thread.
+  u64 kthread_ref = prev_key != DEADLINE_NONE ? prev_key : own_key;
+  if (dctx && kthread_ref != DEADLINE_NONE && !prev_kthread && take_kthread(dctx, own_dsq, kthread_ref))
+    return DSP_TOOK;
 
   if (prev_key != DEADLINE_NONE && (own_key == DEADLINE_NONE || (!yielded && !key_before(own_key, prev_key))))
     return DSP_PREV;

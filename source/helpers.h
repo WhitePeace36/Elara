@@ -143,6 +143,13 @@ static __always_inline void note_unqueued(struct task_ctx* tctx)
 // cpu.
 static __always_inline void note_queued(struct task_struct* p, struct task_ctx* tctx, u32 cpu)
 {
+  // For take_kthread() (see kthread_queued).
+  if (is_percpu_kthread(p))
+  {
+    struct dispatch_ctx* kctx = get_dispatch_ctx(cpu);
+    if (kctx)
+      kctx->kthread_queued = true;
+  }
   if (!track_queued_weight())
     return;
   note_unqueued(tctx);

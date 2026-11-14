@@ -174,6 +174,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(elara_init)
     dispatch_ctx->local_weight = 0;
     dispatch_ctx->queued_weight = 0;
     dispatch_ctx->preempt_pending = false;
+    dispatch_ctx->running_kthread = false;
+    dispatch_ctx->kthread_queued = false;
     dispatch_ctx->rt_busy = RT_BUSY_UNKNOWN;
 
     u32 key = cpu & (MAX_CPUS - 1);
@@ -632,15 +634,19 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
   bool running_ours = dctx && dctx->running_deadline != DEADLINE_NONE;
 
   // A per-cpu kernel thread (kworker/N, ksoftirqd/N, ...) can only run on this
-  // cpu and is done in a moment: it goes first, whatever the keys say (see
-  // task_slack()). By key alone it lost to a task that stayed runnable and
-  // was behind: a woken task brings at most LAG_EARLY_MAX_NS of lag, a
-  // runnable one up to LAG_LATE_MAX_NS. With stress-ng --cpu 0 next to a game,
-  // kworker/N:1H (nice -20) waited 14ms while stress-ng ran on, kworker/N:1
-  // 82ms. Not one that used up its last slice: a kernel thread with real
-  // work (ksoftirqd under an interrupt flood) is scheduled by key like the
-  // rest. Not in front of another task already on its way to preempt.
-  if (may_preempt && running_ours && target == cpu && !dctx->preempt_key && is_percpu_kthread(p) && !tctx->cpu_bound)
+  // cpu and is done in a moment: it goes first (see task_slack()), as long as
+  // its key is less than KTHREAD_AHEAD_NS past the running task's. By key alone
+  // it lost to a task that stayed runnable and was behind: a woken task brings
+  // at most LAG_EARLY_MAX_NS of lag, a runnable one up to LAG_LATE_MAX_NS. With
+  // stress-ng --cpu 0 next to a game, kworker/N:1H (nice -20) waited 14ms while
+  // stress-ng ran on, kworker/N:1 82ms. A kernel thread with real work
+  // (ksoftirqd under an interrupt flood) uses up that lead and is scheduled by
+  // key like the rest. (Its cpu_bound mark can't tell: stopping() clears it
+  // whenever a task sleeps, so it was clear for every woken thread.) Not in
+  // front of another task already on its way to preempt, nor of another
+  // per-cpu kernel thread (like dispatch).
+  if (may_preempt && running_ours && target == cpu && !dctx->preempt_key && !dctx->running_kthread && is_percpu_kthread(p) &&
+      key_before(tctx->key, dctx->running_key + KTHREAD_AHEAD_NS))
   {
     dctx->preempt_pending = true;
     dctx->preempt_key = tctx->key;
@@ -930,6 +936,7 @@ void BPF_STRUCT_OPS(elara_running, struct task_struct* p)
   dispatch_ctx->running_deadline = context->deadline;
   dispatch_ctx->running_since = now;
   dispatch_ctx->running_slack = effective_slack(p, context);
+  dispatch_ctx->running_kthread = is_percpu_kthread(p);
   dispatch_ctx->running_cpu_bound = context->cpu_bound;
   dispatch_ctx->running_short = runs_short(context);
   dispatch_ctx->running_brief = !context->cpu_bound && context->run_avg < BRIEF_RUN_NS;
