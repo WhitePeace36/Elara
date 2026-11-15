@@ -332,6 +332,56 @@ static __always_inline void apply_wake_boost(struct task_struct* p, struct task_
   tctx->boost_limit = tctx->boost_credit < WAKE_BOOST_BUDGET_NS ? tctx->boost_credit : WAKE_BOOST_BUDGET_NS;
 }
 
+// Lag of a woken task queued on @cpu, given @lag from task_lag() (woken: at
+// most LAG_EARLY_MAX_NS ahead of the vtime reference of its cpu).
+//
+// The vtime reference is the highest vtime that started on the cpu, and a task
+// of low weight moves it far ahead: a SCHED_IDLE task (weight 1) adds a second
+// of vtime per ms it runs, so does nice 19; ananicy runs background work like
+// that (BG_CPU, BG_CPUIO) and Service at nice 10. The tasks that compete for
+// the cpu don't move along: one that keeps running keeps its key (dispatch
+// doesn't clamp prev_key), queued ones keep theirs. A woken task placed at most
+// LAG_EARLY_MAX_NS ahead of the reference then had a later key than all of
+// them and waited until their keys caught up, one slice at a time: a 1ms sleeper
+// next to 2 nice 0 cpu hogs per cpu waited 14-102ms a few times a minute (the
+// running hog was 443ms behind the reference), and a 144 fps frame took 374ms
+// once.
+//
+// So it is placed relative to what it competes with: at most LAG_EARLY_MAX_NS
+// ahead of the earliest of the reference, the running task and the head of the
+// queue (like CFS and EEVDF place a woken task near min_vruntime). It only gets
+// earlier than @lag, and only by as far as those are behind the reference: a
+// task that used up its share keeps its later key.
+static __always_inline s64 woken_lag(struct task_struct* p, struct task_ctx* tctx, u32 cpu, s64 lag)
+{
+  struct dispatch_ctx* d = get_dispatch_ctx(cpu);
+  if (!d)
+    return lag;
+  u64 ref = d->vtime_ref;
+  u64 floor = ref;
+  if (d->running_deadline != DEADLINE_NONE && d->running_key != DEADLINE_NONE)
+  {
+    u64 running_vtime = d->running_key - d->running_slack;
+    if (key_before(running_vtime, floor))
+      floor = running_vtime;
+  }
+  u64 head_key = dsq_head_key(cpu_dsq(cpu));
+  if (head_key != DEADLINE_NONE && key_before(head_key, floor))
+    floor = head_key;
+  s64 behind = (s64)(ref - floor);
+  if (behind <= 0)
+    return lag;
+  // Its own lag, not clamped (what it is really behind: task_lag() for a
+  // runnable task stops at LAG_LATE_MAX_NS, 6ms at nice 0, while the running
+  // task was hundreds of ms behind), but not more than LAG_EARLY_MAX_NS ahead
+  // of @floor.
+  s64 own = tctx->vtime_cpu == VTIME_CPU_NONE ? 0 : (s64)(tctx->vtime - cpu_vtime_ref(tctx->vtime_cpu));
+  s64 min_lag = -behind - (s64)LAG_EARLY_MAX_NS;
+  if (own < min_lag)
+    own = min_lag;
+  return own < lag ? own : lag;
+}
+
 // Set the key and deadline a task is queued with on @cpu: its lag moves along
 // to @cpu, @slack is the slack for this time in the queue.
 static __always_inline void set_queue_keys(struct task_ctx* tctx, u32 cpu, u64 now, u64 slack, s64 lag)
@@ -626,6 +676,8 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
     tctx->shared_since = 0;
   }
 
+  if (enq_flags & SCX_ENQ_WAKEUP)
+    lag = woken_lag(p, tctx, target, lag);
   set_queue_keys(tctx, target, now, slack, lag);
   if (reenq)
     tctx->deadline = kept_deadline;
@@ -801,9 +853,17 @@ void BPF_STRUCT_OPS(elara_dispatch, s32 cpu, struct task_struct* prev)
       }
       else
       {
+        // Its lag is clamped like that of a task queued again after its
+        // slice (set_queue_keys()). Unclamped, a task that kept its cpu fell
+        // behind the vtime reference without bound while tasks of low weight
+        // moved the reference ahead (see woken_lag()): a nice 0 cpu hog went
+        // on for ~300ms while it was 364ms behind, and the other tasks of its
+        // cpu waited that long, woken ones and preempted ones alike.
         u64 slack = effective_slack(prev, pctx);
+        s64 lag = task_lag(prev, pctx, false);
+        rebase_vtime(pctx, (u32)cpu, lag);
         prev_key = pctx->vtime + slack;
-        prev_deadline = make_deadline(now, slack, task_lag(prev, pctx, false));
+        prev_deadline = make_deadline(now, slack, lag);
       }
     }
   }

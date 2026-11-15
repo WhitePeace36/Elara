@@ -327,7 +327,7 @@ static __always_inline void charge_vtime(const struct task_struct* p, struct tas
 }
 
 // Deadline from the time a task is queued, its slack and its lag. The lag goes
-// in at most LAG_LATE_MAX_NS: it is scaled by weight (up to ~20s at nice 19),
+// in at most LAG_LATE_MAX_NS: it is scaled by weight (up to ~6s at nice 19),
 // and the deadline is the promise of take_overdue(), which has to hold well
 // within the 30s of the sched_ext watchdog.
 static __always_inline u64 make_deadline(u64 now, u64 slack, s64 lag)

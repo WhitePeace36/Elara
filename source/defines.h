@@ -72,8 +72,17 @@
 // another cpu, and limited to -LAG_EARLY_MAX_NS (a task that slept gets at most
 // this much ahead of the others) and +LAG_LATE_MAX_NS scaled by NICE_0_WEIGHT /
 // weight (a task with a low weight uses up much more vtime per slice).
+//
+// LAG_LATE_MAX_NS also bounds how far a runnable task can be behind, and that
+// is what a woken task (at most LAG_EARLY_MAX_NS ahead) has to wait for: with
+// 20ms a 1ms sleeper next to 2 nice 0 cpu hogs per cpu waited behind a hog 20ms
+// behind the reference a few times a minute (16-18ms each, frames of a 144 fps
+// loop up to 32ms). With 6ms (EEVDF bounds lag to about two slices, ~6ms at
+// nice 0) no wakeup waited more than 5ms (frames at most 10ms), and the shares
+// still follow the weights (one cpu, nice 0/1: 1.50, 0/2: 2.25, 0/5: 7.6,
+// -12/-5/0: 17.3/7.3, nice -5/0/0/5/10 to within 2%).
 #define LAG_EARLY_MAX_NS SLICE_NS
-#define LAG_LATE_MAX_NS (20ULL * NS_PER_MS)
+#define LAG_LATE_MAX_NS (6ULL * NS_PER_MS)
 
 // A woken per-cpu kernel thread goes before the running task (and dispatch
 // takes one from its queue before prev) while its key is less than this past
