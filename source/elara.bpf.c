@@ -175,6 +175,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(elara_init)
     dispatch_ctx->queued_weight = 0;
     dispatch_ctx->preempt_pending = false;
     dispatch_ctx->running_kthread = false;
+    dispatch_ctx->running_weight = NICE_0_WEIGHT;
+    dispatch_ctx->heavy_queued = false;
     dispatch_ctx->kthread_queued = false;
     dispatch_ctx->rt_busy = RT_BUSY_UNKNOWN;
 
@@ -330,6 +332,35 @@ static __always_inline void apply_wake_boost(struct task_struct* p, struct task_
   tctx->boost_depth = depth;
   tctx->boost_used = 0;
   tctx->boost_limit = tctx->boost_credit < WAKE_BOOST_BUDGET_NS ? tctx->boost_credit : WAKE_BOOST_BUDGET_NS;
+}
+
+// The vtime reference of @cpu (@d its dispatch_ctx) follows a task that starts
+// (or keeps) running there with vtime @vtime, but not more than
+// LAG_LATE_MAX_NS past the key of the task waiting next in its queue.
+//
+// A task of low weight moved it far ahead in one go (SCHED_IDLE: ~1s of vtime
+// per ms it ran, nice 9: 25ms): the tasks waiting there were suddenly far
+// behind the reference, and a woken task (placed near the reference) waited
+// behind them, a woken nice -12 audio thread for 2-4ms behind nice 0 tasks
+// whose keys were 20ms behind. Bounded by the next task, the reference still
+// follows tasks of low weight where only such tasks wait (a cap of one slice
+// per start gave nice 12 next to nice 10 1% of the cpu instead of 31%), and
+// freely when nothing waits. A task that runs ahead of the reference keeps its
+// lag (task_lag()), so it still waits for its share.
+static __always_inline void advance_vtime_ref(struct dispatch_ctx* d, u32 cpu, u64 vtime)
+{
+  s64 ahead = (s64)(vtime - d->vtime_ref);
+  if (ahead <= 0)
+    return;
+  u64 next_key = dsq_head_key(cpu_dsq(cpu));
+  if (next_key != DEADLINE_NONE)
+  {
+    s64 room = (s64)(next_key + LAG_LATE_MAX_NS - d->vtime_ref);
+    if (room < ahead)
+      ahead = room;
+  }
+  if (ahead > 0)
+    d->vtime_ref += (u64)ahead;
 }
 
 // Lag of a woken task queued on @cpu, given @lag from task_lag() (woken: at
@@ -714,7 +745,12 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
   // preempted right away. A kick (SCX_KICK_PREEMPT) only takes effect through
   // irq_work, which on the test VM cost a woken task ~1.5ms more than EEVDF.
   // Background work doesn't preempt (see background_policy()).
-  bool preempt = may_preempt && running_ours && key_before(tctx->key + PREEMPT_MARGIN_NS, dctx->running_key);
+  // A heavier woken task also preempts a lighter running task that is behind,
+  // within that task's lag limit (see heavier_first()).
+  u64 weight = task_weight(p);
+  bool preempt = may_preempt && running_ours &&
+                 (key_before(tctx->key + PREEMPT_MARGIN_NS, dctx->running_key) ||
+                  heavier_first(tctx->key + PREEMPT_MARGIN_NS, weight, dctx->running_key, dctx->running_weight));
   // The waker runs on @target (this cpu, called from its wakeup) and the
   // wakeup is a sync one (see SYNC_PREEMPT_MIN_NS).
   bool sync = tctx->sync_wake;
@@ -729,8 +765,15 @@ void BPF_STRUCT_OPS(elara_enqueue, struct task_struct* p, u64 enq_flags)
   bool behind = preempt && dctx->preempt_key && !key_before(tctx->key, dctx->preempt_key);
   if (behind)
     preempt = false;
-  u64 head_key = preempt ? dsq_head_key(cpu_dsq(target)) : DEADLINE_NONE;
-  if (preempt && (head_key == DEADLINE_NONE || !key_before(head_key, tctx->key)))
+  // Straight to the local DSQ if it is also the earliest of the queue, or the
+  // head of the queue is lighter and only earlier within its lag limit (see
+  // heavier_first()): otherwise a woken audio thread waited until a background
+  // task at the head had paid its debt.
+  struct task_struct* head = preempt ? dsq_first(cpu_dsq(target)) : NULL;
+  u64 head_key = head ? head->scx.dsq_vtime : DEADLINE_NONE;
+  bool before_head = head_key == DEADLINE_NONE || !key_before(head_key, tctx->key) ||
+                     heavier_first(tctx->key, weight, head_key, task_weight(head));
+  if (preempt && before_head)
   {
     dctx->preempt_pending = true;
     dctx->preempt_key = tctx->key;
@@ -869,7 +912,7 @@ void BPF_STRUCT_OPS(elara_dispatch, s32 cpu, struct task_struct* prev)
   }
 
   bool prev_kthread = prev && is_percpu_kthread(prev);
-  u32 res = dispatch_dsq_per_cpu(cpu, dctx, now, prev_key, prev_deadline, yielded, prev_kthread);
+  u32 res = dispatch_dsq_per_cpu(cpu, dctx, now, prev_key, prev_deadline, yielded, prev_kthread, prev ? task_weight(prev) : NICE_0_WEIGHT);
   // It yielded and another task takes over: it comes back through enqueue()
   // now, which leaves it on this cpu (see yield_pending there).
   if (pctx)
@@ -935,8 +978,8 @@ void BPF_STRUCT_OPS(elara_dispatch, s32 cpu, struct task_struct* prev)
   // The vtime reference follows the running task also when it keeps the cpu:
   // otherwise a task that runs alone for long builds up a lag against its own
   // cpu and carries it along as debt when it moves.
-  if (!pctx->rescued && (s64)(pctx->vtime - dctx->vtime_ref) > 0)
-    dctx->vtime_ref = pctx->vtime;
+  if (!pctx->rescued)
+    advance_vtime_ref(dctx, (u32)cpu, pctx->vtime);
 
   pctx->key = prev_key;
   pctx->deadline = prev_deadline;
@@ -989,14 +1032,15 @@ void BPF_STRUCT_OPS(elara_running, struct task_struct* p)
     rebase_vtime(context, cpu, task_lag(p, context, false));
     context->key = context->vtime + slack;
   }
-  if (!context->rescued && (s64)(context->vtime - dispatch_ctx->vtime_ref) > 0)
-    dispatch_ctx->vtime_ref = context->vtime;
+  if (!context->rescued)
+    advance_vtime_ref(dispatch_ctx, cpu, context->vtime);
 
   dispatch_ctx->running_key = context->key;
   dispatch_ctx->running_deadline = context->deadline;
   dispatch_ctx->running_since = now;
   dispatch_ctx->running_slack = effective_slack(p, context);
   dispatch_ctx->running_kthread = is_percpu_kthread(p);
+  dispatch_ctx->running_weight = task_weight(p);
   dispatch_ctx->running_cpu_bound = context->cpu_bound;
   dispatch_ctx->running_short = runs_short(context);
   dispatch_ctx->running_brief = !context->cpu_bound && context->run_avg < BRIEF_RUN_NS;

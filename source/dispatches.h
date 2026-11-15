@@ -1080,6 +1080,58 @@ static __always_inline bool take_overdue(struct dispatch_ctx* dctx, u64 dsq, u64
 // KTHREAD_SCAN_DEPTH tasks) whose key is less than KTHREAD_AHEAD_NS past @ref
 // into the local DSQ. Only while one may be queued (kthread_queued): mostly
 // none is, and then this costs nothing.
+// Move a task of the own queue @dsq (within KTHREAD_SCAN_DEPTH tasks after its
+// head, key @head_key, weight @head_w) into the local DSQ that is heavier than
+// the head and may go before it (see heavier_first()), and before prev (key
+// @prev_key, weight @prev_w; DEADLINE_NONE: none). Only while one may be
+// queued (heavy_queued). The queue is ordered by key alone: a woken nice -12
+// audio thread queued behind a nice 9 task that waited (a key ~150ms of vtime
+// earlier) waited 3-4ms, until the cpu had run that one.
+static __always_inline bool take_heavier(struct dispatch_ctx* dctx, u64 dsq, u64 head_key, u64 head_w, u64 prev_key, u64 prev_w)
+{
+  if (!dctx->heavy_queued)
+    return false;
+
+  struct task_struct* p;
+  u32 looked = 0;
+  bool maybe_more = false;
+  bpf_for_each(scx_dsq, p, dsq, 0)
+  {
+    if (++looked == 1)
+      continue;
+    if (looked > KTHREAD_SCAN_DEPTH + 1)
+    {
+      maybe_more = true;
+      break;
+    }
+    u64 w = task_weight(p);
+    if (w <= head_w)
+      continue;
+    u64 key = p->scx.dsq_vtime;
+    // Ordered by key: further back none is within the bound of the head.
+    if (!heavier_first(key, w, head_key, head_w))
+    {
+      maybe_more = true;
+      break;
+    }
+    if (prev_key != DEADLINE_NONE && !key_before(key, prev_key) && !heavier_first(key, w, prev_key, prev_w))
+    {
+      maybe_more = true;
+      continue;
+    }
+    if (!scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, SCX_DSQ_LOCAL, 0))
+    {
+      maybe_more = true;
+      continue;
+    }
+    note_local(bpf_get_smp_processor_id(), p);
+    return true;
+  }
+  if (!maybe_more)
+    dctx->heavy_queued = false;
+  return false;
+}
+
 static __always_inline bool take_kthread(struct dispatch_ctx* dctx, u64 dsq, u64 ref)
 {
   if (!dctx->kthread_queued)
@@ -1148,7 +1200,7 @@ static __always_inline bool take_kthread(struct dispatch_ctx* dctx, u64 dsq, u64
 #define DSP_PREV 1
 #define DSP_NONE 2
 static __always_inline u32 dispatch_dsq_per_cpu(u32 cpu, struct dispatch_ctx* dctx, u64 now, u64 prev_key, u64 prev_deadline, bool yielded,
-                                                 bool prev_kthread)
+                                                 bool prev_kthread, u64 prev_weight)
 {
   u64 own_dsq = cpu_dsq(cpu);
   u64 deadline;
@@ -1203,7 +1255,18 @@ static __always_inline u32 dispatch_dsq_per_cpu(u32 cpu, struct dispatch_ctx* dc
   if (dctx && kthread_ref != DEADLINE_NONE && !prev_kthread && take_kthread(dctx, own_dsq, kthread_ref))
     return DSP_TOOK;
 
-  if (prev_key != DEADLINE_NONE && (own_key == DEADLINE_NONE || (!yielded && !key_before(own_key, prev_key))))
+  // The head of the queue goes before prev when it is earlier, or heavier and
+  // only later within the lag limit of prev (see heavier_first()): otherwise a
+  // woken audio thread queued behind another preempting task waited while a
+  // lighter cpu hog that was behind went on for slice after slice (5.6ms).
+  // A heavier task waiting behind a lighter head goes first the same way, if
+  // it goes before prev too.
+  if (dctx && head && own_key != DEADLINE_NONE && !yielded &&
+      take_heavier(dctx, own_dsq, own_key, head_weight, prev_key, prev_weight))
+    return DSP_TOOK;
+  bool head_first = own_key != DEADLINE_NONE &&
+                    (key_before(own_key, prev_key) || heavier_first(own_key, head_weight, prev_key, prev_weight));
+  if (prev_key != DEADLINE_NONE && (own_key == DEADLINE_NONE || (!yielded && !head_first)))
     return DSP_PREV;
   if (own_key != DEADLINE_NONE)
   {

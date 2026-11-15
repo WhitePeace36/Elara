@@ -141,6 +141,12 @@ struct dispatch_ctx
   // the running one, until it starts (0: none)
   u64 preempt_key;
   bool preempt_pending;
+  // weight of the running task (see heavier_first())
+  u64 running_weight;
+  // a task may wait in the queue of this cpu behind a lighter one at its head
+  // (set by note_queued(), cleared by take_heavier() when it finds none). A
+  // hint like kthread_queued.
+  bool heavy_queued;
   // the running task is a per-cpu kernel thread: another one doesn't preempt it
   // ahead of its key (see enqueue())
   bool running_kthread;

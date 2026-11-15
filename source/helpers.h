@@ -150,6 +150,15 @@ static __always_inline void note_queued(struct task_struct* p, struct task_ctx* 
     if (kctx)
       kctx->kthread_queued = true;
   }
+  // For take_heavier() (see heavy_queued): queued while a lighter task heads
+  // the queue, it may have to go before that one.
+  struct task_struct* head = dsq_first(cpu_dsq(cpu));
+  if (head && head != p && task_weight(head) < task_weight(p))
+  {
+    struct dispatch_ctx* hctx = get_dispatch_ctx(cpu);
+    if (hctx)
+      hctx->heavy_queued = true;
+  }
   if (!track_queued_weight())
     return;
   note_unqueued(tctx);
@@ -303,6 +312,27 @@ static __always_inline s64 task_lag(const struct task_struct* p, struct task_ctx
   if (lag < -early_max)
     return -early_max;
   return lag;
+}
+
+// A woken task of weight @w with key @key goes before a lighter task (weight
+// @other_w, key @other_key) while its key is less than the lag limit of that
+// task (LAG_LATE_MAX_NS scaled by its weight, see task_lag()) past that task's.
+//
+// The limit is scaled by weight, so a light task that waited is far behind in
+// vtime and has a key earlier than any woken task: a nice 9 or 14 task that
+// waited (compile, background work) by up to 154ms of vtime or ~1.5s. By key
+// alone a woken nice -12 audio thread (pipewire without rtkit) then waited
+// until that debt was paid, up to the 6ms of LAG_LATE_MAX_NS: 2-6ms, an xrun
+// at 128 frames/48kHz (2.67ms). Owed or not, the light task loses little by
+// running a moment later, and by the weights the heavier one is entitled to
+// the cpu first (nice -12 to nice 9: 3300 times the weight). The bound keeps
+// the shares: a heavier task whose vtime ran ahead by more than the limit
+// (it used more than its weight gives it) is ordered by key again.
+static __always_inline bool heavier_first(u64 key, u64 w, u64 other_key, u64 other_w)
+{
+  if (w <= other_w || !other_w)
+    return false;
+  return key_before(key, other_key + LAG_LATE_MAX_NS * NICE_0_WEIGHT / other_w);
 }
 
 // Move the vtime of a task to @cpu, keeping its lag.
