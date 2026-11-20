@@ -3,7 +3,7 @@
 
 ## Introduction
 
-Scx_elara is a multipurpose scheduler which was developed with ananicy in mind.
+Elara is a multipurpose sched_ext scheduler which was developed with ananicy in mind.
 
 It is an earliest deadline first scheduler with one queue per cpu: the nice value
 decides both how soon a task gets on the cpu and how much cpu time it gets when it
