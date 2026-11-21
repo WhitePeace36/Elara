@@ -64,7 +64,7 @@ static std::string loaded_scheduler()
   return name;
 }
 
-static RunResult run_once()
+static RunResult run_once(bool& attached)
 {
   elara_bpf* skel = elara_bpf__open();
   if (!skel)
@@ -129,6 +129,7 @@ static RunResult run_once()
     return RunResult::Failed;
   }
 
+  attached = true;
   std::cout << "elara scheduler is successfully running!" << std::endl;
 
   bool ejected = false;
@@ -174,20 +175,75 @@ static RunResult run_once()
   return result;
 }
 
+static void usage(const char* prog)
+{
+  std::cout << "Usage: " << prog << " [-h|--help] [-V|--version]\n"
+            << "\n"
+            << "Loads the elara sched_ext scheduler and keeps it running until SIGINT/SIGTERM.\n"
+            << "Normally started by elara.service. Needs root (CAP_SYS_ADMIN, CAP_BPF).\n"
+            << "Task priorities come from nice values (e.g. set by ananicy-cpp).\n";
+}
+
 int main(int argc, const char** argv)
 {
+  // Every option must be handled here: anything else starts loading the
+  // scheduler, and "elara --help" used to try to attach a second instance.
+  for (int i = 1; i < argc; i++)
+  {
+    const std::string_view arg = argv[i];
+    if (arg == "-h" || arg == "--help")
+    {
+      usage(argv[0]);
+      return 0;
+    }
+    if (arg == "-V" || arg == "--version")
+    {
+#ifdef ELARA_VERSION
+      std::cout << "elara " << ELARA_VERSION << std::endl;
+#else
+      std::cout << "elara (version unknown)" << std::endl;
+#endif
+      return 0;
+    }
+    std::cerr << argv[0] << ": unknown option '" << arg << "'\n";
+    usage(argv[0]);
+    return 64;  // EX_USAGE
+  }
+
+  if (geteuid() != 0)
+  {
+    std::cerr << "elara: needs root to load a sched_ext scheduler." << std::endl;
+    return 1;
+  }
+
+  // Only one sched_ext scheduler can be loaded at a time: say so before
+  // loading the BPF programs (which takes a while and logs libbpf errors).
+  if (const std::string other = loaded_scheduler(); !other.empty())
+  {
+    if (other == "scx_elara")
+      std::cerr << "elara is already running (systemctl status elara.service)." << std::endl;
+    else
+      std::cerr << "Another sched_ext scheduler is loaded: " << other
+                << ". Stop it first (e.g. systemctl stop scx.service scx_loader.service)." << std::endl;
+    return 1;
+  }
+
   signal(SIGINT, sig_handler);
   signal(SIGTERM, sig_handler);
 
   RunResult result;
+  bool attached = false;
   do
   {
-    result = run_once();
+    result = run_once(attached);
     if (result == RunResult::Restart && !stop)
       std::cout << "Kernel requested a restart (e.g. CPU hotplug), restarting..." << std::endl;
   } while (result == RunResult::Restart && !stop);
 
-  std::cout << "Shutting down and restoring default kernel scheduler..." << std::endl;
+  // Only true if this process had the scheduler attached: otherwise nothing
+  // changes (a failed load leaves whatever scheduler runs alone).
+  if (attached)
+    std::cout << "Shutting down and restoring default kernel scheduler..." << std::endl;
 
   if (result == RunResult::Ejected)
     return EXIT_EJECTED;

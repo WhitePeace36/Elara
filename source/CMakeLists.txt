@@ -101,6 +101,9 @@ target_include_directories(elara PRIVATE
 # libbpf outside of /usr (e.g. /usr/local) links as well.
 target_link_libraries(elara PRIVATE PkgConfig::LIBBPF)
 
+# For elara --version.
+target_compile_definitions(elara PRIVATE ELARA_VERSION="${ELARA_VERSION}")
+
 target_compile_options(elara PRIVATE
     -Wall -Wextra -Wpedantic -Wno-overlength-strings -fno-strict-aliasing -fwrapv -O3 -flto=thin -Wno-unused-parameter -Wno-missing-declarations
 )
